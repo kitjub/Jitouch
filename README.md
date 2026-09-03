@@ -1,5 +1,11 @@
 # Jitouch
 
+> **Unofficial community fork.** This repository is based on
+> [JitouchApp/Jitouch](https://github.com/JitouchApp/Jitouch) and was modified
+> by [kitjub](https://github.com/kitjub) in September 2026 to support Apple
+> Silicon and current macOS releases. It is not an official release and is not
+> endorsed by the original authors.
+
 **Jitouch** is a Mac application that expands the set of multi-touch gestures for MacBook, Magic Mouse, and Magic Trackpad. These thoughtfully designed gestures enable users to perform frequent tasks more easily such as changing tabs in web browsers, closing windows, minimizing windows, changing spaces, and a lot more.
 
 For more details, see https://www.jitouch.com/.
