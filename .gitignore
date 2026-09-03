@@ -2,4 +2,5 @@ project.xcworkspace
 xcuserdata
 /prefpane/Jitouch.app
 /build
+/backups/
 .DS_Store

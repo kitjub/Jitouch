@@ -44,7 +44,13 @@
     [super dealloc];
 }
 - (BOOL) isEqual:(id)other {
-    return CFEqual(windowRef, other);
+    if (other == self) {
+        return YES;
+    }
+    if (![other isKindOfClass:[SizeHistoryKey class]]) {
+        return NO;
+    }
+    return CFEqual(windowRef, ((SizeHistoryKey *)other)->windowRef);
 }
 
 - (NSUInteger) hash {

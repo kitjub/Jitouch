@@ -8,19 +8,32 @@
 
 #import "Gesture.h"
 #import <math.h>
+#import <time.h>
 #import <unistd.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
+#import <IOKit/IOReturn.h>
 
 #import "Settings.h"
-#import "JitouchAppDelegate.h"
 #import "CursorWindow.h"
 #import "CursorView.h"
 #import "GestureWindow.h"
+#import "JTCommandDispatchPolicy.h"
+#import "JTCloseStrategy.h"
+#import "JTEdgeVolumeScrubPolicy.h"
+#import "JTKeyboardEvent.h"
+#import "JTOneFixTapClassifier.h"
+#import "JTOneFixTapClickSuppression.h"
+#import "JTShortcutDispatchPolicy.h"
+#import "JTThreeFingerDragPolicy.h"
+#import "JTThreeFingerGestureSafety.h"
+#import "JTVolumeStepAccumulator.h"
 #import "SizeHistory.h"
 #import "KeyUtility.h"
+
+extern CursorWindow *cursorWindow;
 
 #define TRACKPAD 0
 #define MAGICMOUSE 1
@@ -34,6 +47,7 @@ static const int builtinTrackpadFamilyIDs[] = {
     103, // retina mbp 13" with the Force Touch trackpad (2015)
     104,
     105, // macbook with touch bar, m1 pro mbp
+    108, // built-in trackpad observed on M1 Pro with macOS 26
     113, // m2 mbp with touch bar
 };
 static const int magicMouseFamilyIDs[] = {
@@ -107,7 +121,7 @@ typedef int (*MTContactCallbackFunction)(MTDeviceRef, Finger*, int, double, int)
 MTDeviceRef MTDeviceCreateDefault(void);
 CFMutableArrayRef MTDeviceCreateList(void);
 void MTRegisterContactFrameCallback(MTDeviceRef, MTContactCallbackFunction);
-void MTDeviceStart(MTDeviceRef, int);
+OSStatus MTDeviceStart(MTDeviceRef, int);
 void MTUnregisterContactFrameCallback(MTDeviceRef, MTContactCallbackFunction);
 void MTDeviceStop(MTDeviceRef);
 void MTDeviceRelease(MTDeviceRef);
@@ -121,20 +135,26 @@ static AXUIElementRef systemWideElement = NULL;
 
 
 static CFMachPortRef eventTap;
+static CFRunLoopSourceRef eventTapRunLoopSource;
 static BOOL recreatingEventTap;
 
 static int quickTabSwitching;
 
 static int middleClickFlag, magicMouseThreeFingerFlag;
 static int trackpadNFingers, trackpadClicked;
+static JTThreeFingerDragPolicy nativeThreeFingerDragPolicy =
+    JT_THREE_FINGER_DRAG_POLICY_INITIALIZER;
+static JTEdgeVolumeScrubPolicy edgeVolumeScrubPolicy =
+    JT_EDGE_VOLUME_SCRUB_POLICY_INITIALIZER;
+static JTVolumeStepAccumulator volumeStepAccumulator =
+    JT_VOLUME_STEP_ACCUMULATOR_INITIALIZER;
+static atomic_bool volumeScrubDrainScheduled = ATOMIC_VAR_INIT(false);
+static JTCommandDispatchPolicy commandDispatchPolicy =
+    JT_COMMAND_DISPATCH_POLICY_INITIALIZER;
+static JTOneFixTapClickSuppression oneFixTapClickSuppression =
+    JT_ONE_FIX_TAP_CLICK_SUPPRESSION_INITIALIZER;
 static int autoScrollFlag;
 static int moveResizeFlag, shouldExitMoveResize;
-
-// distance between two fingers to suppress left click in next/prev tab gesture
-static float twoFingersDistance = 100.0f;
-static BOOL trackpadHasTwoFingers;
-static NSDate *lastTwoFingerDate;
-static NSDate *lastThreeFingerDate;
 
 // suppress four-finger tap if pinky-to-index or index-to-pinky gestures were triggered
 static BOOL trackpadTab4Triggered = FALSE;
@@ -172,6 +192,7 @@ static int nChars;
 static float normPdf[201];
 static float normIPdf[201];
 static void trackpadRecognizerTwo(const Finger *data, int nFingers, double timestamp);
+static uint64_t monotonicTimeNanos(void);
 static void trackpadRecognizerOne(const Finger *data, int nFingers, double timestamp);
 static int mouseRecognizer(float x, float y, int step);
 static void initChars(void);
@@ -194,7 +215,7 @@ static float cosineBetweenVectors(float v0x, float v0y, float v1x, float v1y) {
 }
 
 static bool familyIsBuiltinTrackpad(int familyID) {
-    for (int i = 0; i < sizeof(builtinTrackpadFamilyIDs) / sizeof(builtinTrackpadFamilyIDs[0]); i++) {
+    for (size_t i = 0; i < sizeof(builtinTrackpadFamilyIDs) / sizeof(builtinTrackpadFamilyIDs[0]); i++) {
         if(builtinTrackpadFamilyIDs[i] == familyID)
             return TRUE;
     }
@@ -202,7 +223,7 @@ static bool familyIsBuiltinTrackpad(int familyID) {
 }
 
 static bool familyIsMagicMouse(int familyID) {
-    for (int i = 0; i < sizeof(magicMouseFamilyIDs) / sizeof(magicMouseFamilyIDs[0]); i++) {
+    for (size_t i = 0; i < sizeof(magicMouseFamilyIDs) / sizeof(magicMouseFamilyIDs[0]); i++) {
         if(magicMouseFamilyIDs[i] == familyID)
             return TRUE;
     }
@@ -210,21 +231,94 @@ static bool familyIsMagicMouse(int familyID) {
 }
 
 static bool familyIsMagicTrackpad(int familyID) {
-    for (int i = 0; i < sizeof(magicTrackpadFamilyIDs) / sizeof(magicTrackpadFamilyIDs[0]); i++) {
+    for (size_t i = 0; i < sizeof(magicTrackpadFamilyIDs) / sizeof(magicTrackpadFamilyIDs[0]); i++) {
         if(magicTrackpadFamilyIDs[i] == familyID)
             return TRUE;
     }
     return FALSE;
 }
 
+static void registerAndStartMultitouchDevice(MTDeviceRef device,
+                                              MTContactCallbackFunction callback,
+                                              CFIndex index,
+                                              uint64_t deviceID,
+                                              int familyID) {
+    MTRegisterContactFrameCallback(device, callback);
+    OSStatus status = MTDeviceStart(device, 0);
+    if (status == kIOReturnNotPermitted) {
+        NSLog(@"Could not start multitouch device %li %" PRIu64
+              " family %d (status %d). Allow Jitouch in System Settings -> "
+              "Privacy & Security -> Input Monitoring, then relaunch Jitouch.",
+              (long)index, deviceID, familyID, (int)status);
+    } else if (status != noErr) {
+        NSLog(@"Could not start multitouch device %li %" PRIu64
+              " family %d (status %d).",
+              (long)index, deviceID, familyID, (int)status);
+    }
+}
+
+/// Complete any pointer-button transformation before abandoning its state.
+/// Merely clearing `simulating` can strand a middle/right/left button in the
+/// down state when an event tap times out, the engine stops, or native drag
+/// protection takes ownership mid-sequence.
+static void releaseSimulatedPointerState(void) {
+    int previousSimulation = simulating;
+    simulating = 0;
+    simulatingByDevice = 0;
+
+    CGEventType mouseUpType;
+    CGMouseButton button;
+    CGEventFlags flags = 0;
+    switch (previousSimulation) {
+        case MIDDLEBUTTONDOWN:
+            mouseUpType = kCGEventOtherMouseUp;
+            button = kCGMouseButtonCenter;
+            break;
+        case LEFTBUTTONDOWN:
+            mouseUpType = kCGEventLeftMouseUp;
+            button = kCGMouseButtonLeft;
+            break;
+        case RIGHTBUTTONDOWN:
+            mouseUpType = kCGEventRightMouseUp;
+            button = kCGMouseButtonRight;
+            break;
+        case COMMANDANDLEFTBUTTONDOWN:
+            mouseUpType = kCGEventLeftMouseUp;
+            button = kCGMouseButtonLeft;
+            flags = kCGEventFlagMaskCommand;
+            break;
+        default:
+            // IGNOREMOUSE never delivered a down event, so it only needs its
+            // internal state cleared.
+            return;
+    }
+
+    CGEventRef probe = CGEventCreate(NULL);
+    CGPoint location = probe != NULL ? CGEventGetLocation(probe) : CGPointZero;
+    if (probe != NULL) CFRelease(probe);
+    CGEventRef mouseUp = CGEventCreateMouseEvent(NULL, mouseUpType, location, button);
+    if (mouseUp == NULL) return;
+    CGEventSetIntegerValueField(mouseUp, kCGMouseEventButtonNumber, button);
+    if (flags != 0) CGEventSetFlags(mouseUp, flags);
+    CGEventPost(kCGSessionEventTap, mouseUp);
+    CFRelease(mouseUp);
+}
+
 static void turnOffTrackpad() {
     trackpadNFingers = 0;
+    JTThreeFingerDragPolicyReset(&nativeThreeFingerDragPolicy);
+    JTEdgeVolumeScrubPolicyReset(&edgeVolumeScrubPolicy);
+    JTVolumeStepAccumulatorClear(&volumeStepAccumulator);
+    JTOneFixTapClickSuppressionReset(&oneFixTapClickSuppression);
+    autoScrollFlag = 0;
 }
 
 static void turnOffMagicMouse() {
+    if (simulating != 0 && simulatingByDevice == MAGICMOUSE) {
+        releaseSimulatedPointerState();
+    }
     middleClickFlag = 0;
     magicMouseThreeFingerFlag = 0;
-    simulating = 0;
     disableHorizontalScroll = 0;
     quickTabSwitching = 0;
     [cursorWindow orderOut:nil];
@@ -240,6 +334,7 @@ static void turnOffCharacters() {
 }
 
 void turnOffGestures() {
+    releaseSimulatedPointerState();
     turnOffTrackpad();
     turnOffMagicMouse();
     turnOffCharacters();
@@ -279,9 +374,13 @@ static void getMousePosition(CGFloat *x, CGFloat *y) {
 }
 
 static CFTypeRef getForemostApp() {
-    CFTypeRef focusedAppRef;
-    if (systemWideElement && AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedApplicationAttribute, &focusedAppRef) != kAXErrorSuccess) {
+    CFTypeRef focusedAppRef = NULL;
+    if (!systemWideElement ||
+        AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedApplicationAttribute, &focusedAppRef) != kAXErrorSuccess) {
         NSRunningApplication *frontmostApplication = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (frontmostApplication == nil) {
+            return NULL;
+        }
         focusedAppRef = AXUIElementCreateApplication([frontmostApplication processIdentifier]);
         if (focusedAppRef == NULL) {
             return NULL;
@@ -608,23 +707,32 @@ static BOOL isMouseOnEmptySpace() {
 static NSString* commandForGesture(NSString *gesture, int device) {
     NSString *ret = nil;
     CFTypeRef axui = axuiUnderMouse();
+    pid_t targetPID = 0;
+    if (axui && AXUIElementGetPid((AXUIElementRef)axui, &targetPID) == kAXErrorSuccess &&
+        targetPID == getpid()) {
+        CFSafeRelease(axui);
+        return nil;
+    }
     NSString *application = nameOfAxui(axui);
 
-    NSDictionary *commandDict;
+    NSDictionary *commandDict = nil;
     if (device == TRACKPAD) {
-        commandDict = [[trackpadMap objectForKey:application] objectForKey:gesture];
-        if (!commandDict)
-            commandDict = [[trackpadMap objectForKey:@"All Applications"] objectForKey:gesture];
-    } else {
-        commandDict = [[magicMouseMap objectForKey:application] objectForKey:gesture];
-        if (!commandDict)
-            commandDict = [[magicMouseMap objectForKey:@"All Applications"] objectForKey:gesture];
+        commandDict = [Settings copyCommandForApplication:application
+                                                   gesture:gesture
+                                               commandsKey:@"TrackpadCommands"
+                                           includeCatchAll:NO];
+    } else if (device == MAGICMOUSE) {
+        commandDict = [Settings copyCommandForApplication:application
+                                                   gesture:gesture
+                                               commandsKey:@"MagicMouseCommands"
+                                           includeCatchAll:NO];
     }
 
     if (commandDict && [[commandDict objectForKey:@"Enable"] boolValue]) {
-        ret = [commandDict objectForKey:@"Command"];
+        ret = [[[commandDict objectForKey:@"Command"] retain] autorelease];
     }
 
+    [commandDict release];
     CFSafeRelease((CFStringRef)application);
     CFSafeRelease(axui);
 
@@ -633,12 +741,84 @@ static NSString* commandForGesture(NSString *gesture, int device) {
 
 
 static void dispatchCommand(NSString *gesture, int device) {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+    // This is the engine-side enforcement layer. Settings UI validation can be
+    // bypassed by imported legacy preferences, so conflicting three-contact
+    // motion/click gestures must also be rejected at dispatch time.
+    if (device == TRACKPAD && nativeThreeFingerDragProtection &&
+        JTThreeFingerGestureConflictsWithNativeDrag(gesture)) {
+        if (logLevel >= LOG_LEVEL_INFO) {
+            NSLog(@"Blocked gesture \"%@\" to protect macOS three-finger dragging", gesture);
+        }
+        return;
+    }
+
+    if (!JTCommandDispatchPolicyTryEnqueue(&commandDispatchPolicy)) {
+        if (logLevel >= LOG_LEVEL_INFO) {
+            NSLog(@"Dropped gesture \"%@\": command queue is full", gesture);
+        }
+        return;
+    }
+    CFAbsoluteTime enqueuedAt = CFAbsoluteTimeGetCurrent();
+
+    // Command dispatch reaches AppKit through NSWorkspace/NSWindow and can also
+    // re-enter this process through Accessibility when the pointer is over the
+    // Jitouch settings window. macOS 26 traps those operations off the main
+    // thread ("Must only be used from the main thread"). Gesture recognition
+    // already runs asynchronously, so serialize the resulting UI/AX command on
+    // the main queue instead of a global worker queue.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CFTimeInterval age = CFAbsoluteTimeGetCurrent() - enqueuedAt;
+        if (!JTCommandDispatchPolicyBeginExecution(&commandDispatchPolicy, age)) {
+            if (logLevel >= LOG_LEVEL_INFO) {
+                NSLog(@"Dropped stale gesture \"%@\" after %.3f s", gesture, age);
+            }
+            return;
+        }
         NSDate *start = [NSDate date];
         doCommand(gesture, device);
         NSTimeInterval timeInterval = -[start timeIntervalSinceNow];
         if (device >= 0 && device < sizeof(deviceTypeName) / sizeof(deviceTypeName[0]) && logLevel >= LOG_LEVEL_INFO) NSLog(@"Gesture \"%@\" for %@ took %f s", gesture, deviceTypeName[device], timeInterval);
     });
+}
+
+static void simulateKeyForTarget(NSString *key,
+                                 BOOL shiftDown,
+                                 BOOL controlDown,
+                                 BOOL optionDown,
+                                 BOOL commandDown,
+                                 pid_t targetPID) {
+    [keyUtil simulateKey:key
+                ShftDown:shiftDown
+                CtrlDown:controlDown
+                 AltDown:optionDown
+                 CmdDown:commandDown
+               targetPID:targetPID];
+}
+
+static void simulateKeyCodeForTarget(CGKeyCode keyCode,
+                                     BOOL shiftDown,
+                                     BOOL controlDown,
+                                     BOOL optionDown,
+                                     BOOL commandDown,
+                                     pid_t targetPID) {
+    [keyUtil simulateKeyCode:keyCode
+                    ShftDown:shiftDown
+                    CtrlDown:controlDown
+                     AltDown:optionDown
+                     CmdDown:commandDown
+                   targetPID:targetPID];
+}
+
+static void simulateKeyCodeForUserSession(CGKeyCode keyCode,
+                                          BOOL shiftDown,
+                                          BOOL controlDown,
+                                          BOOL optionDown,
+                                          BOOL commandDown) {
+    [keyUtil simulateKeyCode:keyCode
+                    ShftDown:shiftDown
+                    CtrlDown:controlDown
+                     AltDown:optionDown
+                     CmdDown:commandDown];
 }
 
 
@@ -649,28 +829,31 @@ static void doCommand(NSString *gesture, int device) {
     } else {
         axui = axuiUnderMouse();
     }
+    pid_t targetPID = 0;
+    if (axui && AXUIElementGetPid((AXUIElementRef)axui, &targetPID) == kAXErrorSuccess &&
+        targetPID == getpid()) {
+        CFSafeRelease(axui);
+        return;
+    }
     NSString *application = nameOfAxui(axui);
 
     NSDictionary *commandDict = nil;
 
     if (device == TRACKPAD) {
-        commandDict = [[trackpadMap objectForKey:application] objectForKey:gesture];
-        if (!commandDict || ![[commandDict objectForKey:@"Enable"] boolValue])
-            commandDict = [[trackpadMap objectForKey:application] objectForKey:@"All Unassigned Gestures"];
-        if (!commandDict || ![[commandDict objectForKey:@"Enable"] boolValue])
-            commandDict = [[trackpadMap objectForKey:@"All Applications"] objectForKey:gesture];
+        commandDict = [Settings copyCommandForApplication:application
+                                                   gesture:gesture
+                                               commandsKey:@"TrackpadCommands"
+                                           includeCatchAll:YES];
     } else if (device == MAGICMOUSE) {
-        commandDict = [[magicMouseMap objectForKey:application] objectForKey:gesture];
-        if (!commandDict || ![[commandDict objectForKey:@"Enable"] boolValue])
-            commandDict = [[magicMouseMap objectForKey:application] objectForKey:@"All Unassigned Gestures"];
-        if (!commandDict || ![[commandDict objectForKey:@"Enable"] boolValue])
-            commandDict = [[magicMouseMap objectForKey:@"All Applications"] objectForKey:gesture];
+        commandDict = [Settings copyCommandForApplication:application
+                                                   gesture:gesture
+                                               commandsKey:@"MagicMouseCommands"
+                                           includeCatchAll:YES];
     } else if (device == CHARRECOGNITION) {
-        commandDict = [[recognitionMap objectForKey:application] objectForKey:gesture];
-        if (!commandDict || ![[commandDict objectForKey:@"Enable"] boolValue])
-            commandDict = [[recognitionMap objectForKey:application] objectForKey:@"All Unassigned Gestures"];
-        if (!commandDict || ![[commandDict objectForKey:@"Enable"] boolValue])
-            commandDict = [[recognitionMap objectForKey:@"All Applications"] objectForKey:gesture];
+        commandDict = [Settings copyCommandForApplication:application
+                                                   gesture:gesture
+                                               commandsKey:@"RecognitionCommands"
+                                           includeCatchAll:YES];
     }
 
     if (commandDict && [[commandDict objectForKey:@"Enable"] boolValue]) {
@@ -684,10 +867,10 @@ static void doCommand(NSString *gesture, int device) {
             if ([command isEqualToString:@"-"]) {
 
             } else if ([command isEqualToString:@"Next Tab"]) {
-                [keyUtil simulateKey:@"Tab" ShftDown:NO CtrlDown:YES AltDown:NO CmdDown:NO];
+                simulateKeyForTarget(@"Tab", NO, YES, NO, NO, targetPID);
                 //[keyUtil simulateKey:@"]" ShftDown:YES CtrlDown:NO AltDown:NO CmdDown:YES];
             } else if ([command isEqualToString:@"Previous Tab"]) {
-                [keyUtil simulateKey:@"Tab" ShftDown:YES CtrlDown:YES AltDown:NO CmdDown:NO];
+                simulateKeyForTarget(@"Tab", YES, YES, NO, NO, targetPID);
                 //[keyUtil simulateKey:@"[" ShftDown:YES CtrlDown:NO AltDown:NO CmdDown:YES];
             } else if ([command isEqualToString:@"Open Link in New Tab"]) {
                 CGEventRef ourEvent = CGEventCreate(NULL);
@@ -710,31 +893,38 @@ static void doCommand(NSString *gesture, int device) {
                 if (device != CHARRECOGNITION)
                     tmpRef = activateWindowAtPosition(x, y);
                 if ([application isEqualToString:@"Terminal"]) {
-                    [keyUtil simulateKey:@"F" ShftDown:NO CtrlDown:NO AltDown:YES CmdDown:YES];
+                    simulateKeyForTarget(@"F", NO, NO, YES, YES, targetPID);
                 } else if ([application isEqualToString:@"Finder"]) {
                 } else {
-                    [keyUtil simulateKey:@"F" ShftDown:NO CtrlDown:YES AltDown:NO CmdDown:YES];
+                    simulateKeyForTarget(@"F", NO, YES, NO, YES, targetPID);
                 }
                 CFSafeRelease(tmpRef);
             } else if ([command isEqualToString:@"Open Recently Closed Tab"]) {
                 if (![application isEqualToString:@"Safari"]) {
-                    [keyUtil simulateKey:@"T" ShftDown:YES CtrlDown:NO AltDown:NO CmdDown:YES];
+                    simulateKeyForTarget(@"T", YES, NO, NO, YES, targetPID);
                 } else {
-                    [keyUtil simulateKey:@"Z" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                    simulateKeyForTarget(@"Z", NO, NO, NO, YES, targetPID);
                 }
             } else if ([command isEqualToString:@"Close / Close Tab"]) {
-                CFTypeRef tmpRef = nil;
-                if (device != CHARRECOGNITION)
-                    tmpRef = activateWindowAtPosition(x, y);
-                [keyUtil simulateKey:@"W" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
-                CFSafeRelease(tmpRef);
+                JTCloseAttempt closeAttempt = JTTryDismissTransientCloseSurface((AXUIElementRef)axui);
+                if (closeAttempt != JTCloseAttemptDismissed) {
+                    CFTypeRef tmpRef = nil;
+                    if (device != CHARRECOGNITION)
+                        tmpRef = activateWindowAtPosition(x, y);
+                    if (closeAttempt == JTCloseAttemptNeedsEscape) {
+                        simulateKeyCodeForTarget(53, NO, NO, NO, NO, targetPID);
+                    } else {
+                        simulateKeyForTarget(@"W", NO, NO, NO, YES, targetPID);
+                    }
+                    CFSafeRelease(tmpRef);
+                }
             } else if ([command isEqualToString:@"Quit"]) {
                 //if the user's using VMware/RDC, should we send cmd+q or alt+f4 ?
                 if (![application isEqualToString:@"Finder"]) {
                     CFTypeRef tmpRef = nil;
                     if (device != CHARRECOGNITION)
                         tmpRef = activateWindowAtPosition(x, y);
-                    [keyUtil simulateKey:@"Q" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                    simulateKeyForTarget(@"Q", NO, NO, NO, YES, targetPID);
                     CFSafeRelease(tmpRef);
                 } else {
                     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
@@ -748,7 +938,7 @@ static void doCommand(NSString *gesture, int device) {
                 CFTypeRef tmpRef = nil;
                 if (device != CHARRECOGNITION)
                     tmpRef = activateWindowAtPosition(x, y);
-                [keyUtil simulateKey:@"H" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                simulateKeyForTarget(@"H", NO, NO, NO, YES, targetPID);
                 CFSafeRelease(tmpRef);
             } else if ([command isEqualToString:@"Minimize"]) {
                 CFTypeRef tmpRef = nil;
@@ -779,17 +969,17 @@ static void doCommand(NSString *gesture, int device) {
                 maximizeWindow(tmpRef, 3);
                 CFSafeRelease(tmpRef);
             } else if ([command isEqualToString:@"Copy"]) {
-                [keyUtil simulateKey:@"C" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                simulateKeyForTarget(@"C", NO, NO, NO, YES, targetPID);
             } else if ([command isEqualToString:@"Paste"]) {
-                [keyUtil simulateKey:@"V" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                simulateKeyForTarget(@"V", NO, NO, NO, YES, targetPID);
             } else if ([command isEqualToString:@"New"]) {
-                [keyUtil simulateKey:@"N" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                simulateKeyForTarget(@"N", NO, NO, NO, YES, targetPID);
             } else if ([command isEqualToString:@"New Tab"]) {
-                [keyUtil simulateKey:@"T" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                simulateKeyForTarget(@"T", NO, NO, NO, YES, targetPID);
             } else if ([command isEqualToString:@"Open"]) {
-                [keyUtil simulateKey:@"O" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                simulateKeyForTarget(@"O", NO, NO, NO, YES, targetPID);
             } else if ([command isEqualToString:@"Save"]) {
-                [keyUtil simulateKey:@"S" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                simulateKeyForTarget(@"S", NO, NO, NO, YES, targetPID);
             } else if ([command isEqualToString:@"Launch Finder"]) {
                 NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
                 [[NSWorkspace sharedWorkspace] launchApplication:@"Finder"];
@@ -876,10 +1066,10 @@ static void doCommand(NSString *gesture, int device) {
                 if (device != CHARRECOGNITION)
                     tmpRef = activateWindowAtPosition(x, y);
                 if ([application isEqualToString:@"Mail"]) {
-                    [keyUtil simulateKey:@"N" ShftDown:YES CtrlDown:NO AltDown:NO CmdDown:YES];
+                    simulateKeyForTarget(@"N", YES, NO, NO, YES, targetPID);
                 } else if ([application isEqualToString:@"Preview"] || [application isEqualToString:@"iChat"]) {
                 } else {
-                    [keyUtil simulateKey:@"R" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                    simulateKeyForTarget(@"R", NO, NO, NO, YES, targetPID);
                 }
                 CFSafeRelease(tmpRef);
             } else if ([command isEqualToString:@"Scroll to Top"]) {
@@ -887,18 +1077,18 @@ static void doCommand(NSString *gesture, int device) {
                 if (device != CHARRECOGNITION)
                     tmpRef = activateWindowAtPosition(x, y);
                 if ([application isEqualToString:@"Microsoft Word"])
-                    [keyUtil simulateKey:@"Home" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                    simulateKeyForTarget(@"Home", NO, NO, NO, YES, targetPID);
                 else
-                    [keyUtil simulateKey:@"Home" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:NO];
+                    simulateKeyForTarget(@"Home", NO, NO, NO, NO, targetPID);
                 CFSafeRelease(tmpRef);
             } else if ([command isEqualToString:@"Scroll to Bottom"]) {
                 CFTypeRef tmpRef = nil;
                 if (device != CHARRECOGNITION)
                     tmpRef = activateWindowAtPosition(x, y);
                 if ([application isEqualToString:@"Microsoft Word"])
-                    [keyUtil simulateKey:@"End" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:YES];
+                    simulateKeyForTarget(@"End", NO, NO, NO, YES, targetPID);
                 else
-                    [keyUtil simulateKey:@"End" ShftDown:NO CtrlDown:NO AltDown:NO CmdDown:NO];
+                    simulateKeyForTarget(@"End", NO, NO, NO, NO, targetPID);
                 CFSafeRelease(tmpRef);
             } else if ([command isEqualToString:@"Application Switcher"]) {
                 CoreDockSendNotification(@"com.apple.appswitcher.awake");
@@ -935,8 +1125,12 @@ static void doCommand(NSString *gesture, int device) {
                         //[alert setInformativeText:@""];
                         [alert setAlertStyle:NSWarningAlertStyle];
                         [NSApp activateIgnoringOtherApps:YES];
-                        //[alert runModal];
-                        [alert beginSheetModalForWindow:[(JitouchAppDelegate*)[NSApp delegate] window] completionHandler:nil]; //use non-modal
+                        NSWindow *hostWindow = [NSApp keyWindow] ?: [NSApp mainWindow];
+                        if (hostWindow) {
+                            [alert beginSheetModalForWindow:hostWindow completionHandler:nil];
+                        } else {
+                            [alert runModal];
+                        }
                         [alert release];
                     }
                     [pool release];
@@ -948,11 +1142,18 @@ static void doCommand(NSString *gesture, int device) {
             }
         } else {
             // shortcut
-            CFTypeRef tmpRef = nil;
-            if (device != CHARRECOGNITION)
-                tmpRef = activateWindowAtPosition(x, y);
-
             NSUInteger modifierFlags = [[commandDict objectForKey:@"ModifierFlags"] unsignedIntegerValue];
+            CGKeyCode shortcutKeyCode =
+                (CGKeyCode)[[commandDict objectForKey:@"KeyCode"] unsignedShortValue];
+            JTShortcutFocusPolicy focusPolicy =
+                JTShortcutFocusPolicyForChord(shortcutKeyCode,
+                                              modifierFlags);
+            CFTypeRef tmpRef = nil;
+            if (device != CHARRECOGNITION &&
+                focusPolicy == JTShortcutFocusPolicyActivatePointerTarget) {
+                tmpRef = activateWindowAtPosition(x, y);
+            }
+
             if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Key \"%@%@%@%@%@\" for application \"%@\"",
                                                    (modifierFlags & kCGEventFlagMaskShift)? @"⇧" : @"",
                                                    (modifierFlags & kCGEventFlagMaskControl)? @"⌃" : @"",
@@ -960,16 +1161,25 @@ static void doCommand(NSString *gesture, int device) {
                                                    (modifierFlags & kCGEventFlagMaskCommand)? @"⌘ " : @"",
                                                    [KeyUtility codeToChar:(CGKeyCode)[[commandDict objectForKey:@"KeyCode"] unsignedIntValue]],
                                                    application);
-            [keyUtil simulateKeyCode:[[commandDict objectForKey:@"KeyCode"] unsignedShortValue]
-                            ShftDown:(modifierFlags & kCGEventFlagMaskShift) != 0
-                            CtrlDown:(modifierFlags & kCGEventFlagMaskControl) != 0
-                             AltDown:(modifierFlags & kCGEventFlagMaskAlternate) != 0
-                             CmdDown:(modifierFlags & kCGEventFlagMaskCommand) != 0];
+            /*
+             * Recorded shortcuts remain session-wide so macOS global hotkeys
+             * get the same opportunity to handle them as a physical keyboard.
+             * App-switch chords are frontmost-relative, so their focus policy
+             * deliberately skips pointer-window activation; ordinary recorded
+             * shortcuts retain Jitouch's focus-follows-pointer behavior.
+             */
+            simulateKeyCodeForUserSession(
+                shortcutKeyCode,
+                (modifierFlags & kCGEventFlagMaskShift) != 0,
+                (modifierFlags & kCGEventFlagMaskControl) != 0,
+                (modifierFlags & kCGEventFlagMaskAlternate) != 0,
+                (modifierFlags & kCGEventFlagMaskCommand) != 0);
             CFSafeRelease(tmpRef);
 
         }
     }
 
+    [commandDict release];
     CFSafeRelease((CFStringRef)application);
     CFSafeRelease(axui);
 }
@@ -991,6 +1201,11 @@ static void gestureTrackpadChangeSpace(const Finger *data, int nFingers) {
     static int mini;
     static int move = 0;
     static float last[2];
+    if (nativeThreeFingerDragProtection) {
+        step = 0;
+        move = 0;
+        return;
+    }
     if (step == 0 && nFingers == 2) {
         if (lenSqrF(data, 0, 1) < 0.1) {
             step = 1;
@@ -1415,6 +1630,13 @@ static void gestureTrackpadOneFixTwoSlide(const Finger *data, int nFingers, doub
     static int lastNFingers;
     static CGFloat fixX, fixY;
     static float fing[3][2];
+    if (nativeThreeFingerDragProtection) {
+        ena = 0;
+        reset = 0;
+        lastNFingers = 0;
+        waitFor4 = -1;
+        return;
+    }
     if (!reset && (nFingers >= 3 && nFingers <= 4)) {
         if (lastNFingers != nFingers)
             ena = 0;
@@ -1572,11 +1794,14 @@ static void gestureTrackpadThreeFingerTap(const Finger *data, int nFingers, doub
 
 static void gestureTrackpadOneFixOneTap(const Finger *data, int nFingers, double timestamp) {
     static double sttime = -1;
-    static float fing[2][2];
+    static float fixedStart[2];
+    static float tappingStart[2];
     static int step = 0;
     static double restTime = -1;
-    static int fixId;
-    static float avgx, avgy;
+    static int fixId = -1;
+    static int tappingId = -1;
+    static JTOneFixTapClassifier classifier =
+        JT_ONE_FIX_TAP_CLASSIFIER_INITIALIZER;
 
     if (nFingers == 0) {
         restTime = -1;
@@ -1585,6 +1810,8 @@ static void gestureTrackpadOneFixOneTap(const Finger *data, int nFingers, double
     if (step == 0 && nFingers == 1) {
         step = 1;
         fixId = data[0].identifier;
+        tappingId = -1;
+        JTOneFixTapClassifierReset(&classifier);
         sttime = -1;
         if (restTime < 0)
             restTime = timestamp;
@@ -1596,39 +1823,88 @@ static void gestureTrackpadOneFixOneTap(const Finger *data, int nFingers, double
                     sttime = timestamp;
                 if ((data[0].identifier == fixId || data[0].size > stvt / 10) &&
                    (data[1].identifier == fixId || data[1].size > stvt / 10)) {
-                    step = 2;
-                    avgx = (data[0].px + data[1].px) / 2;
-                    avgy = (data[0].py + data[1].py) / 2;
-                    fing[0][0] = data[0].px;
-                    fing[0][1] = data[0].py;
-                    fing[1][0] = data[1].px;
-                    fing[1][1] = data[1].py;
+                    int fixedIndex = data[0].identifier == fixId ? 0 :
+                                     (data[1].identifier == fixId ? 1 : -1);
+                    if (fixedIndex >= 0) {
+                        int tappingIndex = 1 - fixedIndex;
+                        tappingId = data[tappingIndex].identifier;
+                        if (JTOneFixTapClassifierBegin(
+                                &classifier, fixId, tappingId) &&
+                            JTOneFixTapClassifierAddSample(
+                                &classifier,
+                                data[0].identifier, data[0].px, data[0].py,
+                                data[1].identifier, data[1].px, data[1].py,
+                                enHanded != 0)) {
+                            fixedStart[0] = data[fixedIndex].px;
+                            fixedStart[1] = data[fixedIndex].py;
+                            tappingStart[0] = data[tappingIndex].px;
+                            tappingStart[1] = data[tappingIndex].py;
+                            JTOneFixTapClickSuppressionBegin(
+                                &oneFixTapClickSuppression);
+                            step = 2;
+                        }
+                    }
                 }
-            } else
+            } else {
                 step = 0;
+                JTOneFixTapClassifierReset(&classifier);
+            }
         } else if (nFingers == 1) {
             sttime = -1;
             fixId = data[0].identifier;
-        } else
-            step = 0;
-    } else if (step == 2) {
-        if (nFingers == 1) {
-            if (timestamp - sttime > clickSpeed) {
-                step = 0;
-            } else {
-                if (data[0].identifier == fixId) {
-                    if (enHanded ^ (avgy - data[0].py < data[0].px - avgx))
-                        dispatchCommand(@"One-Fix Left-Tap", TRACKPAD);
-                    else
-                        dispatchCommand(@"One-Fix Right-Tap", TRACKPAD);
-                }
-            }
-            step = 0;
-        } else if (nFingers == 2) {
-            if (lenSqr(data[0].px, data[0].py, fing[0][0], fing[0][1]) > 0.001 || lenSqr(data[1].px, data[1].py, fing[1][0], fing[1][1]) > 0.001)
-                step = 0;
+            tappingId = -1;
+            JTOneFixTapClassifierReset(&classifier);
         } else {
             step = 0;
+            JTOneFixTapClassifierReset(&classifier);
+        }
+    } else if (step == 2) {
+        if (nFingers == 1) {
+            if (timestamp - sttime <= clickSpeed &&
+                data[0].identifier == fixId) {
+                JTOneFixTapDirection direction =
+                    JTOneFixTapClassifierDirection(&classifier);
+                if (direction == JTOneFixTapDirectionLeft) {
+                    dispatchCommand(@"One-Fix Left-Tap", TRACKPAD);
+                } else if (direction == JTOneFixTapDirectionRight) {
+                    dispatchCommand(@"One-Fix Right-Tap", TRACKPAD);
+                } else if (logLevel >= LOG_LEVEL_INFO) {
+                    NSLog(@"Ignored ambiguous One-Fix tap direction");
+                }
+            }
+            JTOneFixTapClickSuppressionEnd(
+                &oneFixTapClickSuppression, monotonicTimeNanos());
+            step = 0;
+            tappingId = -1;
+            JTOneFixTapClassifierReset(&classifier);
+        } else if (nFingers == 2) {
+            int fixedIndex = data[0].identifier == fixId ? 0 :
+                             (data[1].identifier == fixId ? 1 : -1);
+            int tappingIndex = data[0].identifier == tappingId ? 0 :
+                               (data[1].identifier == tappingId ? 1 : -1);
+            if (fixedIndex < 0 || tappingIndex < 0 ||
+                fixedIndex == tappingIndex ||
+                lenSqr(data[fixedIndex].px, data[fixedIndex].py,
+                       fixedStart[0], fixedStart[1]) > 0.001 ||
+                lenSqr(data[tappingIndex].px, data[tappingIndex].py,
+                       tappingStart[0], tappingStart[1]) > 0.001 ||
+                !JTOneFixTapClassifierAddSample(
+                    &classifier,
+                    data[0].identifier, data[0].px, data[0].py,
+                    data[1].identifier, data[1].px, data[1].py,
+                    enHanded != 0)) {
+                JTOneFixTapClickSuppressionEnd(
+                    &oneFixTapClickSuppression, monotonicTimeNanos());
+                step = 0;
+                tappingId = -1;
+                JTOneFixTapClassifierReset(&classifier);
+            }
+        } else {
+            JTOneFixTapClickSuppressionEnd(
+                &oneFixTapClickSuppression, monotonicTimeNanos());
+            step = 0;
+            tappingId = -1;
+            JTOneFixTapClassifierReset(&classifier);
         }
     }
 }
@@ -1640,6 +1916,11 @@ static void gestureTrackpadSwipeThreeFingers(const Finger *data, int nFingers) {
     int step = 0;
     static int type = 0;
     static int l, r;
+    if (nativeThreeFingerDragProtection) {
+        lastNFingers = 0;
+        type = 0;
+        return;
+    }
 
     if (lastNFingers != 3 && nFingers == 3) {
         step = 1;
@@ -1944,60 +2225,169 @@ static void gestureTrackpadTwoFixOneDoubleTap(const Finger *data, int nFingers, 
 }
 
 
+static void scheduleVolumeScrubDrain(void) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(
+            &volumeScrubDrainScheduled, &expected, true,
+            memory_order_acq_rel, memory_order_acquire)) {
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        /* Keep each main-queue turn short. Pending work is capped by the
+         * accumulator, and additional touch frames merge into the same slot
+         * instead of enqueueing more blocks ahead of window commands.
+         */
+        int steps = JTVolumeStepAccumulatorTake(&volumeStepAccumulator, 4);
+        int key = steps > 0 ? NX_KEYTYPE_SOUND_UP : NX_KEYTYPE_SOUND_DOWN;
+        int count = steps >= 0 ? steps : -steps;
+        for (int i = 0; i < count; i++) {
+            [keyUtil simulateSpecialKey:key];
+        }
+
+        atomic_store_explicit(&volumeScrubDrainScheduled, false,
+                              memory_order_release);
+        if (JTVolumeStepAccumulatorPending(&volumeStepAccumulator) != 0) {
+            scheduleVolumeScrubDrain();
+        }
+    });
+}
+
+static void dispatchVolumeScrubSteps(int steps) {
+    if (steps == 0) return;
+    JTVolumeStepAccumulatorAdd(&volumeStepAccumulator, steps);
+    scheduleVolumeScrubDrain();
+}
+
+static void gestureTrackpadEdgeVolumeScrub(const Finger *data, int nFingers,
+                                           double timestamp) {
+    static int mappingsChecked = 0;
+    static bool leftEnabled = false;
+    static bool rightEnabled = false;
+
+    /* Palm/thumb filtering must not turn a raw three-contact sequence into an
+     * eligible two-contact scrub. The policy also blocks every 3 -> 2 release
+     * until all contacts have lifted.
+     */
+    int rawContactCount = trackpadNFingers;
+    if (rawContactCount <= 0) {
+        JTEdgeVolumeScrubPolicyUpdate(&edgeVolumeScrubPolicy, 0, -1, -1,
+                                      0, 0, 0, timestamp,
+                                      leftEnabled, rightEnabled);
+        mappingsChecked = 0;
+        leftEnabled = false;
+        rightEnabled = false;
+        return;
+    }
+    bool nativePassThrough =
+        JTThreeFingerDragPolicyIsPassThroughActive(&nativeThreeFingerDragPolicy);
+    if (rawContactCount != 2 || nFingers != 2 || nativePassThrough) {
+        int policyContactCount = nFingers;
+        if (nativePassThrough) {
+            policyContactCount = 3;
+        } else if (rawContactCount >= 3) {
+            policyContactCount = rawContactCount;
+        }
+        JTEdgeVolumeScrubPolicyUpdate(&edgeVolumeScrubPolicy,
+                                      policyContactCount, -1, -1,
+                                      0, 0, 0, timestamp,
+                                      leftEnabled, rightEnabled);
+        return;
+    }
+
+    if (!mappingsChecked) {
+        /* Edge volume is a system-level hardware control. Reading its global
+         * mapping directly keeps ordinary two-finger scrolling completely out
+         * of the synchronous Accessibility routing path.
+         */
+        leftEnabled = [Settings
+            isGlobalTrackpadGesture:@"Left-Side Volume Scrub"
+                  enabledForCommand:@"Volume Scrub"];
+        rightEnabled = [Settings
+            isGlobalTrackpadGesture:@"Right-Side Volume Scrub"
+                  enabledForCommand:@"Volume Scrub"];
+        mappingsChecked = 1;
+    }
+
+    float firstX = data[0].px;
+    float secondX = data[1].px;
+    /* Handedness normalization mirrors x before recognizers run. Mirror back so
+     * Left/Right continue to name physical trackpad edges.
+     */
+    if (enHanded) {
+        firstX = 1.0f - firstX;
+        secondX = 1.0f - secondX;
+    }
+    JTEdgeVolumeScrubResult result = JTEdgeVolumeScrubPolicyUpdate(
+        &edgeVolumeScrubPolicy, 2,
+        data[0].identifier, data[1].identifier,
+        fminf(firstX, secondX), fmaxf(firstX, secondX),
+        (data[0].py + data[1].py) / 2.0f,
+        timestamp,
+        leftEnabled, rightEnabled);
+    dispatchVolumeScrubSteps(result.volumeSteps);
+}
+
 static void gestureTrackpadAutoScroll(const Finger *data, int nFingers, double timestamp) {
     static double sttime;
     static int step = 0;
     static float midY;
-    float x[2] = {data[0].px, data[1].px};
     static int startAlready = 0;
     static int shouldCheck = 1, chk[2];
+
+    /* Check count before indexing contacts. The legacy code read data[0] and
+     * data[1] on release frames. Volume scrub owns only scroll-wheel events and
+     * the auto-scroll recognizer stands down while it is active.
+     */
+    if (JTEdgeVolumeScrubPolicyIsActive(&edgeVolumeScrubPolicy) ||
+        JTThreeFingerDragPolicyIsPassThroughActive(&nativeThreeFingerDragPolicy) ||
+        nFingers != 2) {
+        step = 0;
+        startAlready = 0;
+        autoScrollFlag = 0;
+        if (nFingers < 2) shouldCheck = 1;
+        return;
+    }
+
+    float x[2] = {data[0].px, data[1].px};
     if (enHanded) {
         x[0] = 1 - x[0];
         x[1] = 1 - x[1];
     }
 
     if (step == 0) {
-        if (nFingers == 2) {
-            if (((x[0] < x[1]) ? x[0] : x[1]) < 0.08 || ((x[0] > x[1]) ? x[0] : x[1]) > 0.92) {
-                if (shouldCheck) {
-                    chk[0] = [commandForGesture(@"Left-Side Scroll", TRACKPAD) isEqualToString:@"Auto Scroll"];
-                    chk[1] = [commandForGesture(@"Right-Side Scroll", TRACKPAD) isEqualToString:@"Auto Scroll"];
-                    shouldCheck = 0;
-                }
-                if (
-                   (chk[0] && ((x[0] < x[1]) ? x[0] : x[1]) < 0.08) ||
-                   (chk[1] && ((x[0] > x[1]) ? x[0] : x[1]) > 0.92)
-                   ) {
-                    step = 1;
-                    startAlready = 0;
-                    midY = (data[0].py + data[1].py) / 2;
-                }
+        if (((x[0] < x[1]) ? x[0] : x[1]) < 0.08 ||
+            ((x[0] > x[1]) ? x[0] : x[1]) > 0.92) {
+            if (shouldCheck) {
+                chk[0] = [commandForGesture(@"Left-Side Scroll", TRACKPAD) isEqualToString:@"Auto Scroll"];
+                chk[1] = [commandForGesture(@"Right-Side Scroll", TRACKPAD) isEqualToString:@"Auto Scroll"];
+                shouldCheck = 0;
             }
-        } else if (nFingers == 1) {
-            shouldCheck = 1;
+            if ((chk[0] && ((x[0] < x[1]) ? x[0] : x[1]) < 0.08) ||
+                (chk[1] && ((x[0] > x[1]) ? x[0] : x[1]) > 0.92)) {
+                step = 1;
+                startAlready = 0;
+                midY = (data[0].py + data[1].py) / 2;
+            }
         }
-    } else if (step == 1) {
-        if (timestamp > sttime) {
-            float avgY = (data[0].py + data[1].py) / 2;
-            float speedf = -((midY - avgY) * (midY - avgY) * (midY - avgY) * 50 * 8);
-            if (!startAlready && fabs(speedf) < 0.1)
-                speedf = 0;
-            else
-                startAlready = 1;
+    } else if (step == 1 && timestamp > sttime) {
+        float avgY = (data[0].py + data[1].py) / 2;
+        float speedf = -((midY - avgY) * (midY - avgY) *
+                         (midY - avgY) * 50 * 8);
+        if (!startAlready && fabs(speedf) < 0.1)
+            speedf = 0;
+        else
+            startAlready = 1;
 
-            int speed = (int)(speedf < 0 ? floorf(speedf) : ceilf(speedf));
-            autoScrollFlag = speed == 0 ? 0 : (speed > 0 ? 1 : -1);
-            CGEventRef eventRef = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitPixel, 1, speed);
-            if (eventRef) {
-                CGEventPost(kCGHIDEventTap, eventRef);
-                CFRelease(eventRef);
-            }
-            sttime = timestamp + 0.01;
+        int speed = (int)(speedf < 0 ? floorf(speedf) : ceilf(speedf));
+        autoScrollFlag = speed == 0 ? 0 : (speed > 0 ? 1 : -1);
+        CGEventRef eventRef = CGEventCreateScrollWheelEvent(
+            NULL, kCGScrollEventUnitPixel, 1, speed);
+        if (eventRef) {
+            CGEventPost(kCGHIDEventTap, eventRef);
+            CFRelease(eventRef);
         }
-        if (nFingers != 2) {
-            step = 0;
-            autoScrollFlag = 0;
-        }
+        sttime = timestamp + 0.01;
     }
 }
 
@@ -2005,21 +2395,9 @@ static void gestureTrackpadAutoScroll(const Finger *data, int nFingers, double t
 static int trackpadCallback(MTDeviceRef device, Finger *data, int nFingers, double timestamp, int frame) {
     if (DEBUG && logLevel >= LOG_LEVEL_TRACE) NSLog(@"TrackpadCallback %p", device);
     trackpadNFingers = nFingers;
-    if (nFingers == 2) {
-        twoFingersDistance = lenSqrF(data, 0, 1);
-    } else if (nFingers > 2) {
-        twoFingersDistance = 100;
-        lastThreeFingerDate = [NSDate date];
-        lastTwoFingerDate = [NSDate dateWithTimeIntervalSinceNow:-10];
-    } else {
-        twoFingersDistance = 100;
-    }
-    if (twoFingersDistance < 0.3f && fabs([lastThreeFingerDate timeIntervalSinceNow]) > 0.05) {
-        trackpadHasTwoFingers = TRUE;
-        lastTwoFingerDate = [NSDate date];
-    } else {
-        trackpadHasTwoFingers = FALSE;
-    }
+    JTThreeFingerDragPolicyUpdate(&nativeThreeFingerDragPolicy,
+                                  nativeThreeFingerDragProtection != 0,
+                                  nFingers);
 
     static int thumbId = -1;
     Finger *dataUnnormalized = (Finger *)malloc(sizeof(Finger) * nFingers);
@@ -2126,6 +2504,7 @@ static int trackpadCallback(MTDeviceRef device, Finger *data, int nFingers, doub
 
         if (!gestureTrackpadMoveResize(data, nFingers, timestamp)) {
             if (!isTrackpadRecognizing) {
+                gestureTrackpadEdgeVolumeScrub(data, nFingers, timestamp);
                 gestureTrackpadAutoScroll(data, nFingers, timestamp);
 
                 gestureTrackpadOneFixOneTap(data, nFingers, timestamp);
@@ -2627,6 +3006,7 @@ static int gestureMagicMouseThumb(const Finger *data, int nFingers) {
                 CGEventPost(kCGSessionEventTap, eventRef);
                 CFRelease(eventRef);
                 simulating = 0;
+                simulatingByDevice = 0;
             }
         }
     } else if (type == 1) {
@@ -2645,6 +3025,7 @@ static int gestureMagicMouseThumb(const Finger *data, int nFingers) {
             CGEventPost(kCGSessionEventTap, eventRef);
             CFRelease(eventRef);
             simulating = 0;
+            simulatingByDevice = 0;
         }
     }
     return ret;
@@ -2821,17 +3202,13 @@ static int magicMouseCallback(MTDeviceRef device, Finger *data, int nFingers, do
 
         if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Start device %li %"PRIu64", family %d (%s)", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
         if (familyIsBuiltinTrackpad(familyID)) {
-            MTRegisterContactFrameCallback(device, trackpadCallback);
-            MTDeviceStart(device, 0);
+            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
         } else if (familyIsMagicMouse(familyID)) {
-            MTRegisterContactFrameCallback(device, magicMouseCallback);
-            MTDeviceStart(device, 0);
+            registerAndStartMultitouchDevice(device, magicMouseCallback, i, deviceID, familyID);
         } else if (familyIsMagicTrackpad(familyID)) {
-            MTRegisterContactFrameCallback(device, trackpadCallback);
-            MTDeviceStart(device, 0);
+            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
         } else if (familyID >= MINFAMILYID) { // Unknown ID. Assume it's a trackpad.
-            MTRegisterContactFrameCallback(device, trackpadCallback);
-            MTDeviceStart(device, 0);
+            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
         }
         if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Device %li %"PRIu64" family %d is %s", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
 
@@ -2929,18 +3306,78 @@ static void multitouchDeviceRemoved(void* refCon, io_iterator_t iterator) {
 
 #pragma mark - CGEventCallback
 
+static JTOneFixPointerEvent oneFixPointerEventForCGEventType(
+    CGEventType type) {
+    switch (type) {
+        case kCGEventLeftMouseDown:
+            return JTOneFixPointerEventLeftDown;
+        case kCGEventLeftMouseUp:
+            return JTOneFixPointerEventLeftUp;
+        case kCGEventLeftMouseDragged:
+            return JTOneFixPointerEventLeftDragged;
+        case kCGEventRightMouseDown:
+            return JTOneFixPointerEventRightDown;
+        case kCGEventRightMouseUp:
+            return JTOneFixPointerEventRightUp;
+        case kCGEventRightMouseDragged:
+            return JTOneFixPointerEventRightDragged;
+        case kCGEventOtherMouseDown:
+            return JTOneFixPointerEventOtherDown;
+        case kCGEventOtherMouseUp:
+            return JTOneFixPointerEventOtherUp;
+        case kCGEventOtherMouseDragged:
+            return JTOneFixPointerEventOtherDragged;
+        default:
+            return JTOneFixPointerEventNone;
+    }
+}
+
+static uint64_t monotonicTimeNanos(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+           (uint64_t)now.tv_nsec;
+}
+
 static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
-    if (type == kCGEventLeftMouseDown) {
-        double timeInterval = fabs([lastTwoFingerDate timeIntervalSinceNow]);
-        bool suppress = trackpadHasTwoFingers || timeInterval < 0.05;
-        if (suppress) {
-            if (logLevel >= LOG_LEVEL_DEBUG)
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{NSLog(@"Suppressed MouseDown with %d fingers d=%f t=%f", trackpadNFingers, twoFingersDistance, timeInterval);});
-            return NULL;
-        } else if (logLevel >= LOG_LEVEL_DEBUG)
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{NSLog(@"Did not suppress MouseDown with %d fingers d=%f t=%f", trackpadNFingers, twoFingersDistance, timeInterval);});
-    } else if (logLevel >= LOG_LEVEL_DEBUG && type == kCGEventLeftMouseUp) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{NSLog(@"Did not suppress MouseUp with %d fingers d=%f", trackpadNFingers, twoFingersDistance);});
+    // Native drag protection is fail-open: every pointer event in a native
+    // three-contact sequence is returned untouched before any legacy click,
+    // drawing, scrolling, or simulation logic can consume it. The policy stays
+    // active through the 3 -> 2 -> 1 release so mouse-up cannot be stranded.
+    if (JTThreeFingerDragPolicyIsPassThroughActive(&nativeThreeFingerDragPolicy)) {
+        JTOneFixTapClickSuppressionReset(&oneFixTapClickSuppression);
+        switch (type) {
+            case kCGEventLeftMouseDown:
+            case kCGEventLeftMouseUp:
+            case kCGEventRightMouseDown:
+            case kCGEventRightMouseUp:
+            case kCGEventOtherMouseDown:
+            case kCGEventOtherMouseUp:
+            case kCGEventLeftMouseDragged:
+            case kCGEventRightMouseDragged:
+            case kCGEventOtherMouseDragged:
+            case kCGEventMouseMoved:
+            case kCGEventScrollWheel:
+                releaseSimulatedPointerState();
+                trackpadClicked = 0;
+                return event;
+            default:
+                break;
+        }
+    }
+
+    JTOneFixPointerEvent oneFixEvent =
+        oneFixPointerEventForCGEventType(type);
+    if (oneFixEvent != JTOneFixPointerEventNone &&
+        JTOneFixTapClickSuppressionShouldSuppress(
+            &oneFixTapClickSuppression, oneFixEvent,
+            monotonicTimeNanos())) {
+        trackpadClicked = 0;
+        if (logLevel >= LOG_LEVEL_DEBUG) {
+            NSLog(@"Suppressed pointer event %u owned by One-Fix Tap",
+                  (unsigned int)type);
+        }
+        return NULL;
     }
 
     if (type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown) {
@@ -2950,14 +3387,14 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
             return NULL;
         }
         if (simulating) {   //simulating should be reset when mouseup, but sometimes mouseup doesn't get called
-            simulating = 0; //so we have to reset it manually
+            releaseSimulatedPointerState();
         }
         NSString *gesture = nil;
         int device = 0;
         if (middleClickFlag) {
             gesture = @"Middle Click";
             device = MAGICMOUSE;
-        } else if (trackpadNFingers == 3) {
+        } else if (trackpadNFingers == 3 && !nativeThreeFingerDragProtection) {
             trackpadClicked = 1;
             gesture = @"Three-Finger Click";
             device = TRACKPAD;
@@ -2978,20 +3415,24 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
                 CGEventSetType(event, kCGEventOtherMouseDown);
             } else if ([command isEqualToString:@"Left Click"]) {
                 simulating = LEFTBUTTONDOWN;
+                simulatingByDevice = device;
                 CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, 0);
                 CGEventSetType(event, kCGEventLeftMouseDown);
             } else if ([command isEqualToString:@"Right Click"]) {
                 simulating = RIGHTBUTTONDOWN;
+                simulatingByDevice = device;
                 CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, 1);
                 CGEventSetType(event, kCGEventRightMouseDown);
             } else if ([command isEqualToString:@"Open Link in New Tab"]) {
                 simulating = COMMANDANDLEFTBUTTONDOWN;
+                simulatingByDevice = device;
                 CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, 0);
                 CGEventSetFlags(event, kCGEventFlagMaskCommand);
                 CGEventSetType(event, kCGEventLeftMouseDown);
             } else if (command == nil) {
             } else { // command that will be done by this case must not create a new click event
                 simulating = IGNOREMOUSE;
+                simulatingByDevice = device;
                 dispatchCommand(gesture, device);
                 return NULL;
             }
@@ -3009,30 +3450,37 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
             CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, 2);
             CGEventSetType(event, kCGEventOtherMouseUp);
             simulating = 0;
+            simulatingByDevice = 0;
             if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Simulated MiddleMouseUp");
         } else if (simulating == LEFTBUTTONDOWN) {
             CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, 0);
             CGEventSetType(event, kCGEventLeftMouseUp);
             simulating = 0;
+            simulatingByDevice = 0;
             if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Simulated LeftMouseUp");
         } else if (simulating == RIGHTBUTTONDOWN) {
             CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, 1);
             CGEventSetType(event, kCGEventRightMouseUp);
             simulating = 0;
+            simulatingByDevice = 0;
             if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Simulated RightMouseUp");
         } else if (simulating == COMMANDANDLEFTBUTTONDOWN) {
             CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, 0);
             CGEventSetFlags(event, kCGEventFlagMaskCommand);
             CGEventSetType(event, kCGEventLeftMouseUp);
             simulating = 0;
+            simulatingByDevice = 0;
             if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Simulated CommandLeftMouseUp");
         } else if (simulating == IGNOREMOUSE) {
             simulating = 0;
+            simulatingByDevice = 0;
             return NULL;
         }
 
     } else if (type == kCGEventScrollWheel) {
-        if (magicMouseThreeFingerFlag || isTrackpadRecognizing)
+        if (JTEdgeVolumeScrubPolicyIsActive(&edgeVolumeScrubPolicy))
+            return NULL;
+        else if (magicMouseThreeFingerFlag || isTrackpadRecognizing)
             return NULL;
         else if (autoScrollFlag) {
             int64_t sc = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
@@ -3055,14 +3503,30 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
             CGEventSetType(event, kCGEventOtherMouseDragged);
         }
     } else if (type == kCGEventTapDisabledByUserInput) {
+        releaseSimulatedPointerState();
+        JTEdgeVolumeScrubPolicyRequestCancel(&edgeVolumeScrubPolicy);
+        JTOneFixTapClickSuppressionReset(&oneFixTapClickSuppression);
         CGEventTapEnable(eventTap, true);
     } else if (type == kCGEventTapDisabledByTimeout) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        releaseSimulatedPointerState();
+        JTEdgeVolumeScrubPolicyRequestCancel(&edgeVolumeScrubPolicy);
+        JTOneFixTapClickSuppressionReset(&oneFixTapClickSuppression);
+        // Event taps and their retry timers belong to the main run loop.  A
+        // timer scheduled from a global queue has no run loop and never fires.
+        dispatch_async(dispatch_get_main_queue(), ^{
             if (recreatingEventTap) return;
             recreatingEventTap = TRUE;
-            NSLog(@"Received kCGEventTapDisabledByTimeout; attempting to recreate CGEventTap. Allow Jitouch in System Preferences -> Privacy -> Accessibility.");
-            CFMachPortInvalidate(eventTap);
-            CFRelease(eventTap);
+            NSLog(@"Received kCGEventTapDisabledByTimeout; attempting to recreate CGEventTap. Allow Jitouch in System Settings -> Privacy & Security -> Accessibility.");
+            if (eventTapRunLoopSource != NULL) {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapRunLoopSource, kCFRunLoopCommonModes);
+                CFRelease(eventTapRunLoopSource);
+                eventTapRunLoopSource = NULL;
+            }
+            if (eventTap != NULL) {
+                CFMachPortInvalidate(eventTap);
+                CFRelease(eventTap);
+                eventTap = NULL;
+            }
             eventTap = [me createEventTap];
             if (eventTap == nil) {
                 NSLog(@"Could not create CGEventTap. Scheduling retries.");
@@ -3171,7 +3635,10 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
     if (eventTap != nil) {
         CGEventTapEnable(eventTap, true);
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
-        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, kCFRunLoopCommonModes);
+        if (runLoopSource != NULL) {
+            CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, kCFRunLoopCommonModes);
+            eventTapRunLoopSource = runLoopSource;
+        }
     }
 
     return eventTap;
@@ -3207,9 +3674,6 @@ CFMutableArrayRef deviceList;
 
         systemWideElement = AXUIElementCreateSystemWide();
 
-        lastTwoFingerDate = [NSDate date];
-        lastThreeFingerDate = [NSDate date];
-
         // Character Recognizer
         initNormPdf();
         initChars();
@@ -3224,17 +3688,13 @@ CFMutableArrayRef deviceList;
                 MTDeviceGetDeviceID(device, &deviceID);
                 if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Start device %li %"PRIu64" family %d (%s)", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
                 if (familyIsBuiltinTrackpad(familyID)) {
-                    MTRegisterContactFrameCallback(device, trackpadCallback);
-                    MTDeviceStart(device, 0);
+                    registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
                 } else if (familyIsMagicMouse(familyID)) {
-                    MTRegisterContactFrameCallback(device, magicMouseCallback);
-                    MTDeviceStart(device, 0);
+                    registerAndStartMultitouchDevice(device, magicMouseCallback, i, deviceID, familyID);
                 } else if (familyIsMagicTrackpad(familyID)) {
-                    MTRegisterContactFrameCallback(device, trackpadCallback);
-                    MTDeviceStart(device, 0);
+                    registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
                 } else if (familyID >= MINFAMILYID) { // Unknown ID. Assume it's a trackpad.
-                    MTRegisterContactFrameCallback(device, trackpadCallback);
-                    MTDeviceStart(device, 0);
+                    registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
                 }
                 if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Device %li %"PRIu64" family %d is %s", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
             }
@@ -3274,7 +3734,7 @@ CFMutableArrayRef deviceList;
 
         eventTap = [me createEventTap];
         if (eventTap == nil) {
-            NSLog(@"Could not create CGEventTap. Allow Jitouch in System Preferences -> Privacy -> Accessibility.");
+            NSLog(@"Could not create CGEventTap. Allow Jitouch in System Settings -> Privacy & Security -> Accessibility.");
             recreatingEventTap = TRUE;
             eventTapTries = 0;
             [NSTimer scheduledTimerWithTimeInterval:1.0 target:me selector:@selector(createEventTapTimer:) userInfo:nil repeats:NO];
@@ -3315,17 +3775,13 @@ CFMutableArrayRef deviceList;
         MTDeviceGetDeviceID(device, &deviceID);
         if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Start device %li %"PRIu64", family %d (%s)", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
         if (familyIsBuiltinTrackpad(familyID)) {
-            MTRegisterContactFrameCallback(device, trackpadCallback);
-            MTDeviceStart(device, 0);
+            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
         } else if (familyIsMagicMouse(familyID)) {
-            MTRegisterContactFrameCallback(device, magicMouseCallback);
-            MTDeviceStart(device, 0);
+            registerAndStartMultitouchDevice(device, magicMouseCallback, i, deviceID, familyID);
         } else if (familyIsMagicTrackpad(familyID)) {
-            MTRegisterContactFrameCallback(device, trackpadCallback);
-            MTDeviceStart(device, 0);
+            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
         } else if (familyID >= MINFAMILYID) { // Unknown ID. Assume it's a trackpad.
-            MTRegisterContactFrameCallback(device, trackpadCallback);
-            MTDeviceStart(device, 0);
+            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
         }
         if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Device %li %"PRIu64" family %d is %s", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
     }
@@ -4297,7 +4753,25 @@ static void trackpadRecognizerTwo(const Finger *data, int nFingers, double times
 #pragma mark -
 
 - (void) dealloc {
-    CFRelease(deviceList);
+    releaseSimulatedPointerState();
+    if (eventTapRunLoopSource != NULL) {
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapRunLoopSource, kCFRunLoopCommonModes);
+        CFRelease(eventTapRunLoopSource);
+        eventTapRunLoopSource = NULL;
+    }
+    if (eventTap != NULL) {
+        CFMachPortInvalidate(eventTap);
+        CFRelease(eventTap);
+        eventTap = NULL;
+    }
+    if (systemWideElement != NULL) {
+        CFRelease(systemWideElement);
+        systemWideElement = NULL;
+    }
+    if (deviceList != NULL) {
+        CFRelease(deviceList);
+        deviceList = NULL;
+    }
     [super dealloc];
 }
 

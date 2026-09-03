@@ -6,6 +6,7 @@
 //
 
 #import "KeyUtility.h"
+#import "JTKeyboardEvent.h"
 #import <Carbon/Carbon.h>
 
 // to suppress "'CGPostKeyboardEvent' is deprecated" warnings
@@ -14,6 +15,24 @@
 @implementation KeyUtility
 
 static CGKeyCode a[128];
+
+static void PostKeyboardPair(CGKeyCode keyCode,
+                             CGEventFlags flags,
+                             JTKeyboardEventDelivery delivery,
+                             pid_t targetPID) {
+    JTKeyboardEventStroke strokes[JT_KEYBOARD_EVENT_MAX_CHORD_STROKES];
+    size_t count = JTKeyboardEventBuildStrokePlan(
+        keyCode, flags, delivery, strokes,
+        JT_KEYBOARD_EVENT_MAX_CHORD_STROKES);
+    if (count > JT_KEYBOARD_EVENT_MAX_CHORD_STROKES) return;
+
+    for (size_t i = 0; i < count; i++) {
+        CGEventRef event = JTKeyboardEventCreate(
+            strokes[i].keyCode, strokes[i].keyDown, strokes[i].flags);
+        JTKeyboardEventPost(event, delivery, targetPID);
+        if (event != NULL) CFRelease(event);
+    }
+}
 
 static void languageChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     for (int i = 0; i < 128; i++)
@@ -53,33 +72,28 @@ static void languageChanged(CFNotificationCenterRef center, void *observer, CFSt
 }
 
 - (void)simulateKeyCode:(CGKeyCode)code ShftDown:(BOOL)shft CtrlDown:(BOOL)ctrl AltDown:(BOOL)alt CmdDown:(BOOL)cmd {
-
-     if (shft)
-     CGPostKeyboardEvent((CGCharCode)0, (CGKeyCode)56, true);
-     if (ctrl)
-     CGPostKeyboardEvent((CGCharCode)0, (CGKeyCode)59, true);
-     if (alt)
-     CGPostKeyboardEvent((CGCharCode)0, (CGKeyCode)58, true);
-     if (cmd)
-     CGPostKeyboardEvent((CGCharCode)0, (CGKeyCode)55, true);
-
-     CGPostKeyboardEvent((CGCharCode)0, a[code], true);
-     CGPostKeyboardEvent((CGCharCode)0, a[code], false);
-
-     if (shft)
-     CGPostKeyboardEvent((CGCharCode)0, (CGKeyCode)56, false);
-     if (ctrl)
-     CGPostKeyboardEvent((CGCharCode)0, (CGKeyCode)59, false);
-     if (alt)
-     CGPostKeyboardEvent((CGCharCode)0, (CGKeyCode)58, false);
-     if (cmd)
-     CGPostKeyboardEvent((CGCharCode)0, (CGKeyCode)55, false);
-
+    if (code >= 128) return;
+    CGEventFlags flags = JTKeyboardEventModifierFlags(shft, ctrl, alt, cmd);
+    PostKeyboardPair(a[code], flags,
+                     JTKeyboardEventDeliveryUserSession, 0);
 }
 
 - (void) simulateKey:(NSString *)key ShftDown:(BOOL)shft CtrlDown:(BOOL)ctrl AltDown:(BOOL)alt CmdDown:(BOOL)cmd {
+    [self simulateKey:key ShftDown:shft CtrlDown:ctrl AltDown:alt
+              CmdDown:cmd targetPID:0];
+}
+
+- (void)simulateKeyCode:(CGKeyCode)code ShftDown:(BOOL)shft CtrlDown:(BOOL)ctrl AltDown:(BOOL)alt CmdDown:(BOOL)cmd targetPID:(pid_t)targetPID {
+    if (code >= 128) return;
+    CGEventFlags flags = JTKeyboardEventModifierFlags(shft, ctrl, alt, cmd);
+    PostKeyboardPair(a[code], flags,
+                     JTKeyboardEventDeliveryTargetApplication, targetPID);
+}
+
+- (void)simulateKey:(NSString *)key ShftDown:(BOOL)shft CtrlDown:(BOOL)ctrl AltDown:(BOOL)alt CmdDown:(BOOL)cmd targetPID:(pid_t)targetPID {
     CGKeyCode km = [(NSNumber *)[keyMap objectForKey:key] unsignedIntValue];
-    [self simulateKeyCode:km ShftDown:shft CtrlDown:ctrl AltDown:alt CmdDown:cmd];
+    [self simulateKeyCode:km ShftDown:shft CtrlDown:ctrl AltDown:alt
+                  CmdDown:cmd targetPID:targetPID];
 }
 
 - (void)simulateSpecialKey:(int)key {

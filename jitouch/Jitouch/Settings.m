@@ -32,6 +32,7 @@ int logLevel;
 //Trackpad
 int enTPAll;
 int enHanded;
+int nativeThreeFingerDragProtection;
 
 //Magic Mouse
 int enMMAll;
@@ -56,6 +57,59 @@ BOOL isPrefPane;
 @implementation Settings
 
 static int notSynchronize;
+
++ (NSDictionary *)copyCommandForApplication:(NSString *)application
+                             gesture:(NSString *)gesture
+                                 commandsKey:(NSString *)commandsKey
+                             includeCatchAll:(BOOL)includeCatchAll {
+    // Framework-owned surfaces (Quick Look, VisionKit, web/PDF helpers, menu
+    // extras) can expose an AX element without a resolvable process name. An
+    // unknown app cannot use an app-specific assignment, but it must still be
+    // eligible for the user's All Applications gestures.
+    if (gesture == nil) return nil;
+
+    @synchronized(self) {
+        NSDictionary *map = nil;
+        if ([commandsKey isEqualToString:@"TrackpadCommands"]) {
+            map = trackpadMap;
+        } else if ([commandsKey isEqualToString:@"MagicMouseCommands"]) {
+            map = magicMouseMap;
+        } else if ([commandsKey isEqualToString:@"RecognitionCommands"]) {
+            map = recognitionMap;
+        }
+
+        NSDictionary *applicationMap = [map objectForKey:application];
+        NSDictionary *command = [applicationMap objectForKey:gesture];
+        if (includeCatchAll) {
+            if (!command || ![[command objectForKey:@"Enable"] boolValue]) {
+                command = [applicationMap objectForKey:@"All Unassigned Gestures"];
+            }
+            if (!command || ![[command objectForKey:@"Enable"] boolValue]) {
+                command = [[map objectForKey:@"All Applications"] objectForKey:gesture];
+            }
+        } else if (!command) {
+            // Preserve the historical special-gesture behavior: a disabled
+            // application-specific exact assignment shadows the global exact
+            // assignment for commandForGesture().
+            command = [[map objectForKey:@"All Applications"] objectForKey:gesture];
+        }
+        return [command retain];
+    }
+}
+
++ (BOOL)isGlobalTrackpadGesture:(NSString *)gesture
+              enabledForCommand:(NSString *)command {
+    if (gesture == nil || command == nil) return NO;
+
+    NSDictionary *snapshot = [self copyCommandForApplication:@"All Applications"
+                                                      gesture:gesture
+                                                  commandsKey:@"TrackpadCommands"
+                                              includeCatchAll:NO];
+    BOOL enabled = [[snapshot objectForKey:@"Enable"] boolValue] &&
+                   [[snapshot objectForKey:@"Command"] isEqualToString:command];
+    [snapshot release];
+    return enabled;
+}
 
 + (void)noteSettingsUpdated2 {
     NSAutoreleasePool *autoreleasepool = [[NSAutoreleasePool alloc] init];
@@ -177,6 +231,7 @@ static int notSynchronize;
     //Trackpad
     [Settings setKey:@"enTPAll" withInt:1];
     [Settings setKey:@"Handed" withInt:0];
+    [Settings setKey:@"NativeThreeFingerDragProtection" withInt:1];
 
     //Magic Mouse
     [Settings setKey:@"enMMAll" withInt:1];
@@ -217,6 +272,12 @@ static int notSynchronize;
     //Trackpad
     enTPAll = [[settings objectForKey:@"enTPAll"] intValue];
     enHanded = [[settings objectForKey:@"Handed"] intValue];
+    id nativeDragProtection = [settings objectForKey:@"NativeThreeFingerDragProtection"];
+    // Existing installations predate this key. Fail safe: keep macOS native
+    // dragging protected until the user explicitly chooses otherwise.
+    nativeThreeFingerDragProtection = nativeDragProtection == nil
+        ? 1
+        : [nativeDragProtection boolValue];
 
     //Magic Mouse
     enMMAll = [[settings objectForKey:@"enMMAll"] intValue];
@@ -263,20 +324,24 @@ static int notSynchronize;
         }
     };
 
-    // optimization for trackpad commands
-    [trackpadMap release];
-    trackpadMap = [[NSMutableDictionary alloc] init];
-    optimize(trackpadCommands, trackpadMap);
+    // Build complete immutable-enough snapshots before swapping them into the
+    // live engine. Gesture callbacks can continue reading the previous maps
+    // until the synchronized swap completes.
+    NSMutableDictionary *newTrackpadMap = [[NSMutableDictionary alloc] init];
+    NSMutableDictionary *newMagicMouseMap = [[NSMutableDictionary alloc] init];
+    NSMutableDictionary *newRecognitionMap = [[NSMutableDictionary alloc] init];
+    optimize(trackpadCommands, newTrackpadMap);
+    optimize(magicMouseCommands, newMagicMouseMap);
+    optimize(recognitionCommands, newRecognitionMap);
 
-    // optimization for magicmouse commands
-    [magicMouseMap release];
-    magicMouseMap = [[NSMutableDictionary alloc] init];
-    optimize(magicMouseCommands, magicMouseMap);
-
-    // optimization for recognition commands
-    [recognitionMap release];
-    recognitionMap = [[NSMutableDictionary alloc] init];
-    optimize(recognitionCommands, recognitionMap);
+    @synchronized(self) {
+        [trackpadMap release];
+        trackpadMap = newTrackpadMap;
+        [magicMouseMap release];
+        magicMouseMap = newMagicMouseMap;
+        [recognitionMap release];
+        recognitionMap = newRecognitionMap;
+    }
 }
 
 + (void)loadSettings {

@@ -21,7 +21,7 @@
     [[NSColor clearColor] set];
     NSRectFill([self frame]);
 
-    CGContextRef context = [[NSGraphicsContext currentContext]graphicsPort];
+    CGContextRef context = [[NSGraphicsContext currentContext] CGContext];
 
     if ([points count] > 0) {
         NSPoint currentPoint;
@@ -94,7 +94,11 @@
 }
 
 - (void)setHintText:(const char*)str {
-    strcpy(hintText, str);
+    if (str == NULL) {
+        hintText[0] = '\0';
+        return;
+    }
+    strlcpy(hintText, str, sizeof(hintText));
 }
 
 - (void)dealloc {

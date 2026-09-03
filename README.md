@@ -6,6 +6,25 @@ For more details, see https://www.jitouch.com/.
 
 ## Installation
 
+### Personal Apple Silicon build for current macOS
+
+This branch includes a nib-free, native arm64 menu-bar app that builds with
+Apple Command Line Tools; full Xcode is not required.
+
+```sh
+make
+make verify
+make probe
+make install
+```
+
+The final app is `build/Jitouch Modern.app`. The personal installer places it in
+`~/Applications`, uses a separate modern LaunchAgent, stops (but does not delete)
+the loaded legacy job, and preserves the existing preferences and Preference
+Pane. See [BUILDING-CLT.md](BUILDING-CLT.md) for details.
+
+### Legacy release
+
 Download `Install-Jitouch.pkg` from the [releases](https://github.com/aaronkollasch/jitouch/releases/latest) page.
 Double-click and follow the instructions to install.
 

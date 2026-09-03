@@ -32,6 +32,7 @@ typedef enum log_level_t : int {
 //Trackpad
 extern int enTPAll;
 extern int enHanded;
+extern int nativeThreeFingerDragProtection;
 
 //Magic Mouse
 extern int enMMAll;
@@ -61,11 +62,25 @@ extern BOOL isPrefPane;
 + (void)setKey:(NSString*)aKey withInt:(int)aValue;
 //+ (void)setKey:(NSString*)aKey withFloat:(float)aValue;
 + (void)setKey:(NSString*)aKey with:(id)aValue;
-//+ (void)trackpadDefault;
-//+ (void)magicMouseDefault;
-//+ (void)recognitionDefault;
-//+ (void)createDefaultPlist;
++ (void)trackpadDefault;
++ (void)magicMouseDefault;
++ (void)recognitionDefault;
++ (void)createDefaultPlist;
 + (void)loadSettings:(id)sender;
 + (void)loadSettings2:(NSDictionary*)newSettings;
+
+/// Returns a retained command snapshot. The caller must release it. Lookups
+/// and map replacement share the same lock so live editor updates cannot free
+/// a command while a gesture thread is using it.
++ (NSDictionary *)copyCommandForApplication:(NSString *)application
+                                     gesture:(NSString *)gesture
+                                 commandsKey:(NSString *)commandsKey
+                             includeCatchAll:(BOOL)includeCatchAll;
+
+/// Fast path for system-level trackpad controls. Unlike normal gesture
+/// routing, this reads only the All Applications map and never asks
+/// Accessibility which application is under the pointer.
++ (BOOL)isGlobalTrackpadGesture:(NSString *)gesture
+              enabledForCommand:(NSString *)command;
 
 @end
