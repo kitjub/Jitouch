@@ -75,6 +75,16 @@ void JTOneFixTapClickSuppressionEnd(
                           memory_order_release);
 }
 
+void JTOneFixTapClickSuppressionContactsLifted(
+    JTOneFixTapClickSuppression *suppression,
+    uint64_t nowNanos) {
+    if (suppression == NULL) return;
+    if (atomic_load_explicit(&suppression->contactOwned,
+                             memory_order_acquire)) {
+        JTOneFixTapClickSuppressionEnd(suppression, nowNanos);
+    }
+}
+
 bool JTOneFixTapClickSuppressionShouldSuppress(
     JTOneFixTapClickSuppression *suppression,
     JTOneFixPointerEvent event,

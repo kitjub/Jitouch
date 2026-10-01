@@ -26,6 +26,7 @@
 #import "JTKeyboardEvent.h"
 #import "JTOneFixTapClassifier.h"
 #import "JTOneFixTapClickSuppression.h"
+#import "JTPreviousWindowPolicy.h"
 #import "JTShortcutDispatchPolicy.h"
 #import "JTThreeFingerDragPolicy.h"
 #import "JTThreeFingerGestureSafety.h"
@@ -130,6 +131,8 @@ void MTDeviceGetFamilyID(MTDeviceRef, int*);
 OSStatus MTDeviceGetDeviceID(MTDeviceRef, uint64_t*) __attribute__ ((weak_import));    // no 10.5
 
 void CoreDockSendNotification(NSString *notificationName);
+// Private but long-stable HIServices export mapping an AX window to its CGWindowID.
+AXError _AXUIElementGetWindow(AXUIElementRef element, CGWindowID *windowID);
 
 static AXUIElementRef systemWideElement = NULL;
 
@@ -599,6 +602,121 @@ static CFTypeRef activateWindowAtPosition(CGFloat x, CGFloat y) {
     return nil;
 }
 
+#pragma mark - Previous Window
+
+// Gesture commands run on the main queue; never let a hung app stall it.
+static AXUIElementRef createApplicationElementWithTimeout(pid_t pid) {
+    AXUIElementRef app = AXUIElementCreateApplication(pid);
+    if (app) {
+        AXUIElementSetMessagingTimeout(app, 0.5);
+    }
+    return app;
+}
+
+static CGWindowID focusedWindowID(void) {
+    CGWindowID windowID = 0;
+    NSRunningApplication *frontmost = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    AXUIElementRef app = frontmost ? createApplicationElementWithTimeout([frontmost processIdentifier]) : NULL;
+    CFTypeRef window = NULL;
+    if (app &&
+        AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, &window) == kAXErrorSuccess &&
+        _AXUIElementGetWindow((AXUIElementRef)window, &windowID) != kAXErrorSuccess) {
+        windowID = 0;
+    }
+    CFSafeRelease(window);
+    CFSafeRelease(app);
+    return windowID;
+}
+
+static AXUIElementRef copyAXWindowWithID(pid_t pid, CGWindowID windowID) {
+    AXUIElementRef app = createApplicationElementWithTimeout(pid);
+    CFTypeRef windows = NULL;
+    AXUIElementRef match = NULL;
+    if (!app) {
+        return NULL;
+    }
+    if (AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &windows) == kAXErrorSuccess && windows) {
+        CFIndex n = CFArrayGetCount((CFArrayRef)windows);
+        for (CFIndex i = 0; i < n && !match; i++) {
+            AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex((CFArrayRef)windows, i);
+            CGWindowID candidateID = 0;
+            if (_AXUIElementGetWindow(window, &candidateID) == kAXErrorSuccess && candidateID == windowID) {
+                match = (AXUIElementRef)CFRetain(window);
+            }
+        }
+    }
+    CFSafeRelease(windows);
+    CFRelease(app);
+    return match;
+}
+
+static BOOL activateWindowWithID(pid_t pid, CGWindowID windowID) {
+    AXUIElementRef window = copyAXWindowWithID(pid, windowID);
+    ProcessSerialNumber psn = {0, 0};
+    if (!window) {
+        return NO;
+    }
+    // Raise within the app first so bringing the app forward surfaces this
+    // window rather than whichever of its windows was frontmost before. A
+    // failed raise lets the caller fall through to the next recent window.
+    AXUIElementSetAttributeValue(window, kAXMainAttribute, kCFBooleanTrue);
+    AXError raised = AXUIElementPerformAction(window, kAXRaiseAction);
+    CFRelease(window);
+    if (raised != kAXErrorSuccess) {
+        return NO;
+    }
+    if (GetProcessForPID(pid, &psn) == noErr) {
+        SetFrontProcessWithOptions(&psn, kSetFrontProcessFrontWindowOnly);
+    }
+    return YES;
+}
+
+/*
+ * Windows-style Alt-Tab: switch to the most recently used window, even when
+ * it belongs to the same application. Command-Tab only switches applications,
+ * so it cannot move between two Chrome windows.
+ */
+static void activatePreviousWindow(void) {
+    CFArrayRef info = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
+                                                 kCGWindowListExcludeDesktopElements,
+                                                 kCGNullWindowID);
+    if (!info) {
+        return;
+    }
+    size_t count = (size_t)CFArrayGetCount(info);
+    JTWindowCandidate *windows = calloc(count ? count : 1, sizeof(*windows));
+    size_t *order = calloc(count ? count : 1, sizeof(*order));
+    if (windows && order) {
+        for (size_t i = 0; i < count; i++) {
+            NSDictionary *entry = (NSDictionary *)CFArrayGetValueAtIndex(info, (CFIndex)i);
+            NSNumber *alpha = [entry objectForKey:(id)kCGWindowAlpha];
+            CGRect bounds = CGRectZero;
+            CFDictionaryRef boundsDict = (CFDictionaryRef)[entry objectForKey:(id)kCGWindowBounds];
+            if (boundsDict) {
+                CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds);
+            }
+            windows[i].windowID = [[entry objectForKey:(id)kCGWindowNumber] unsignedIntValue];
+            windows[i].ownerPID = [[entry objectForKey:(id)kCGWindowOwnerPID] intValue];
+            windows[i].layer = [[entry objectForKey:(id)kCGWindowLayer] intValue];
+            windows[i].alpha = alpha ? [alpha doubleValue] : 1.0;
+            windows[i].width = bounds.size.width;
+            windows[i].height = bounds.size.height;
+        }
+        size_t n = JTPreviousWindowOrderCandidates(windows, count, focusedWindowID(), getpid(), order, count);
+        for (size_t k = 0; k < n; k++) {
+            const JTWindowCandidate *target = &windows[order[k]];
+            if (activateWindowWithID(target->ownerPID, target->windowID)) {
+                if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Previous Window activated window %u of pid %d",
+                                                       target->windowID, target->ownerPID);
+                break;
+            }
+        }
+    }
+    free(order);
+    free(windows);
+    CFRelease(info);
+}
+
 static CGFloat findTabGroup_lx;
 static void findTabGroup2(CFTypeRef windowRef, float cx, float cy) {
     CFTypeRef tmp, tmp2;
@@ -781,6 +899,20 @@ static void dispatchCommand(NSString *gesture, int device) {
     });
 }
 
+/*
+ * Deliver straight to the app under the pointer only while it owns keyboard
+ * focus. An inactive app has no key window and drops events posted to its pid,
+ * so otherwise post through the session and let the focused app receive the
+ * shortcut, as upstream Jitouch always did.
+ */
+static pid_t keyboardTargetPID(pid_t pointerPID) {
+    NSRunningApplication *frontmost = [[NSWorkspace sharedWorkspace] frontmostApplication];
+    if (pointerPID > 0 && frontmost != nil && [frontmost processIdentifier] == pointerPID) {
+        return pointerPID;
+    }
+    return 0;
+}
+
 static void simulateKeyForTarget(NSString *key,
                                  BOOL shiftDown,
                                  BOOL controlDown,
@@ -792,7 +924,7 @@ static void simulateKeyForTarget(NSString *key,
                 CtrlDown:controlDown
                  AltDown:optionDown
                  CmdDown:commandDown
-               targetPID:targetPID];
+               targetPID:keyboardTargetPID(targetPID)];
 }
 
 static void simulateKeyCodeForTarget(CGKeyCode keyCode,
@@ -806,7 +938,7 @@ static void simulateKeyCodeForTarget(CGKeyCode keyCode,
                     CtrlDown:controlDown
                      AltDown:optionDown
                      CmdDown:commandDown
-                   targetPID:targetPID];
+                   targetPID:keyboardTargetPID(targetPID)];
 }
 
 static void simulateKeyCodeForUserSession(CGKeyCode keyCode,
@@ -1092,6 +1224,8 @@ static void doCommand(NSString *gesture, int device) {
                 CFSafeRelease(tmpRef);
             } else if ([command isEqualToString:@"Application Switcher"]) {
                 CoreDockSendNotification(@"com.apple.appswitcher.awake");
+            } else if ([command isEqualToString:@"Previous Window"]) {
+                activatePreviousWindow();
             } else if ([command isEqualToString:@"Play / Pause"]) {
                 [keyUtil simulateSpecialKey:NX_KEYTYPE_PLAY];
             } else if ([command isEqualToString:@"Next"]) {
@@ -2398,6 +2532,10 @@ static int trackpadCallback(MTDeviceRef device, Finger *data, int nFingers, doub
     JTThreeFingerDragPolicyUpdate(&nativeThreeFingerDragPolicy,
                                   nativeThreeFingerDragProtection != 0,
                                   nFingers);
+    if (nFingers == 0) {
+        JTOneFixTapClickSuppressionContactsLifted(&oneFixTapClickSuppression,
+                                                  monotonicTimeNanos());
+    }
 
     static int thumbId = -1;
     Finger *dataUnnormalized = (Finger *)malloc(sizeof(Finger) * nFingers);
@@ -3158,6 +3296,9 @@ static int magicMouseCallback(MTDeviceRef device, Finger *data, int nFingers, do
 #pragma mark - Hardware Add/Remove Notifications
 
 - (void)addMultitouchDevice:(NSTimer*)theTimer {
+    // Between a reload's stop and its delayed restart there is no list; the
+    // restart enumerates every attached device, including this one.
+    if (deviceList == NULL) return;
     BOOL found = NO;
     NSMutableDictionary* dict = [theTimer userInfo];
     int attemptMT = [dict[@"Attempt"] intValue];
@@ -3666,6 +3807,55 @@ int eventTapTries = 0;
 
 #pragma mark - Init
 CFMutableArrayRef deviceList;
+static uint64_t multitouchStartGeneration;
+static IONotificationPortRef multitouchNotificationPort;
+static io_iterator_t multitouchDeviceAddedIterator;
+static io_iterator_t multitouchDeviceRemovedIterator;
+
+static void startMultitouchDevices(void) {
+    deviceList = MTDeviceCreateList();
+    if (deviceList == NULL) return;
+    for (CFIndex i = 0; i < CFArrayGetCount(deviceList); i++) {
+        MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(deviceList, i);
+        int familyID;
+        MTDeviceGetFamilyID(device, &familyID);
+        uint64_t deviceID = 0;
+        MTDeviceGetDeviceID(device, &deviceID);
+        if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Start device %li %"PRIu64", family %d (%s)", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
+        if (familyIsBuiltinTrackpad(familyID)) {
+            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
+        } else if (familyIsMagicMouse(familyID)) {
+            registerAndStartMultitouchDevice(device, magicMouseCallback, i, deviceID, familyID);
+        } else if (familyIsMagicTrackpad(familyID)) {
+            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
+        } else if (familyID >= MINFAMILYID) { // Unknown ID. Assume it's a trackpad.
+            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
+        }
+        if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Device %li %"PRIu64" family %d is %s", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
+    }
+}
+
+// Devices keep calling back into the engine until they are unregistered and
+// stopped; releasing the list alone leaves them running.
+static void stopMultitouchDevices(void) {
+    if (deviceList == NULL) return;
+    for (CFIndex i = 0; i < CFArrayGetCount(deviceList); i++) {
+        MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(deviceList, i);
+        int familyID;
+        MTDeviceGetFamilyID(device, &familyID);
+        uint64_t deviceID = 0;
+        MTDeviceGetDeviceID(device, &deviceID);
+        if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Stop device %li %"PRIu64" family %d (%s)", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
+        if (familyID >= MINFAMILYID) {
+            MTUnregisterContactFrameCallback(device, trackpadCallback);
+            MTUnregisterContactFrameCallback(device, magicMouseCallback);
+            MTDeviceStop(device);
+        }
+        if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Device %li %"PRIu64" family %d is %s", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
+    }
+    CFRelease(deviceList);
+    deviceList = NULL;
+}
 
 - (id)init {
     if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Initializing.");
@@ -3678,28 +3868,9 @@ CFMutableArrayRef deviceList;
         initNormPdf();
         initChars();
 
-        {
-            deviceList = MTDeviceCreateList();
-            for (CFIndex i = 0; i < CFArrayGetCount(deviceList); i++) {
-                MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(deviceList, i);
-                int familyID;
-                MTDeviceGetFamilyID(device, &familyID);
-                uint64_t deviceID = 0;
-                MTDeviceGetDeviceID(device, &deviceID);
-                if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Start device %li %"PRIu64" family %d (%s)", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
-                if (familyIsBuiltinTrackpad(familyID)) {
-                    registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
-                } else if (familyIsMagicMouse(familyID)) {
-                    registerAndStartMultitouchDevice(device, magicMouseCallback, i, deviceID, familyID);
-                } else if (familyIsMagicTrackpad(familyID)) {
-                    registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
-                } else if (familyID >= MINFAMILYID) { // Unknown ID. Assume it's a trackpad.
-                    registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
-                }
-                if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Device %li %"PRIu64" family %d is %s", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
-            }
-            //CFRelease((CFMutableArrayRef)deviceList); // DO NOT release. It'll crash.
-        }
+        // Keep deviceList alive while devices run; stopMultitouchDevices()
+        // stops them before releasing it.
+        startMultitouchDevices();
 
         /*
         io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, matchingDict);
@@ -3709,6 +3880,7 @@ CFMutableArrayRef deviceList;
         */
 
         IONotificationPortRef notificationObject = IONotificationPortCreate(kIOMasterPortDefault);
+        multitouchNotificationPort = notificationObject;
         CFRunLoopSourceRef notificationRunLoopSource = IONotificationPortGetRunLoopSource(notificationObject);
         CFRunLoopAddSource(CFRunLoopGetCurrent(), notificationRunLoopSource, kCFRunLoopDefaultMode);
 
@@ -3717,7 +3889,6 @@ CFMutableArrayRef deviceList;
             matchingDict = (CFMutableDictionaryRef) CFRetain(matchingDict);
 
             //Device added notification
-            io_iterator_t multitouchDeviceAddedIterator;
             IOServiceAddMatchingNotification(notificationObject, kIOFirstMatchNotification, matchingDict, multitouchDeviceAdded, NULL, &multitouchDeviceAddedIterator);
             io_service_t device;
             while ((device = IOIteratorNext(multitouchDeviceAddedIterator))) {
@@ -3727,7 +3898,6 @@ CFMutableArrayRef deviceList;
             multitouchDeviceAdded(NULL, multitouchDeviceAddedIterator);
 
             //Device removed notification
-            io_iterator_t multitouchDeviceRemovedIterator;
             IOServiceAddMatchingNotification(notificationObject, kIOTerminatedNotification, matchingDict, multitouchDeviceRemoved, NULL, &multitouchDeviceRemovedIterator);
             multitouchDeviceRemoved(NULL, multitouchDeviceRemovedIterator);
         }
@@ -3750,41 +3920,16 @@ CFMutableArrayRef deviceList;
 
 - (void)reload {
     if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Reloading gestures.");
-    for (CFIndex i = 0; i < CFArrayGetCount(deviceList); i++) {
-        MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(deviceList, i);
-        int familyID;
-        MTDeviceGetFamilyID(device, &familyID);
-        uint64_t deviceID = 0;
-        MTDeviceGetDeviceID(device, &deviceID);
-        if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Stop device %li %"PRIu64" family %d (%s)", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
-        if (familyID >= MINFAMILYID) {
-            MTUnregisterContactFrameCallback(device, trackpadCallback);
-            MTUnregisterContactFrameCallback(device, magicMouseCallback);
-            MTDeviceStop(device);
+    stopMultitouchDevices();
+    // Give MultitouchSupport a moment before restarting, without blocking the
+    // main thread that also runs gesture commands. A newer reload or engine
+    // teardown bumps the generation and cancels this restart.
+    uint64_t generation = ++multitouchStartGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (generation == multitouchStartGeneration) {
+            startMultitouchDevices();
         }
-        if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Device %li %"PRIu64" family %d is %s", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
-    }
-    CFRelease(deviceList);
-    sleep(1);
-    deviceList = MTDeviceCreateList();
-    for (CFIndex i = 0; i < CFArrayGetCount(deviceList); i++) {
-        MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(deviceList, i);
-        int familyID;
-        MTDeviceGetFamilyID(device, &familyID);
-        uint64_t deviceID = 0;
-        MTDeviceGetDeviceID(device, &deviceID);
-        if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Start device %li %"PRIu64", family %d (%s)", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
-        if (familyIsBuiltinTrackpad(familyID)) {
-            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
-        } else if (familyIsMagicMouse(familyID)) {
-            registerAndStartMultitouchDevice(device, magicMouseCallback, i, deviceID, familyID);
-        } else if (familyIsMagicTrackpad(familyID)) {
-            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
-        } else if (familyID >= MINFAMILYID) { // Unknown ID. Assume it's a trackpad.
-            registerAndStartMultitouchDevice(device, trackpadCallback, i, deviceID, familyID);
-        }
-        if (logLevel >= LOG_LEVEL_INFO) NSLog(@"Device %li %"PRIu64" family %d is %s", (long)i, deviceID, familyID, (MTDeviceIsRunning(device)) ? "running" : "not running");
-    }
+    });
 }
 
 #pragma mark - Character Recognizer
@@ -4754,6 +4899,23 @@ static void trackpadRecognizerTwo(const Finger *data, int nFingers, double times
 
 - (void) dealloc {
     releaseSimulatedPointerState();
+    multitouchStartGeneration++;
+    stopMultitouchDevices();
+    if (multitouchNotificationPort != NULL) {
+        CFRunLoopRemoveSource(CFRunLoopGetMain(),
+                              IONotificationPortGetRunLoopSource(multitouchNotificationPort),
+                              kCFRunLoopDefaultMode);
+        IONotificationPortDestroy(multitouchNotificationPort);
+        multitouchNotificationPort = NULL;
+    }
+    if (multitouchDeviceAddedIterator) {
+        IOObjectRelease(multitouchDeviceAddedIterator);
+        multitouchDeviceAddedIterator = 0;
+    }
+    if (multitouchDeviceRemovedIterator) {
+        IOObjectRelease(multitouchDeviceRemovedIterator);
+        multitouchDeviceRemovedIterator = 0;
+    }
     if (eventTapRunLoopSource != NULL) {
         CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapRunLoopSource, kCFRunLoopCommonModes);
         CFRelease(eventTapRunLoopSource);
@@ -4768,9 +4930,8 @@ static void trackpadRecognizerTwo(const Finger *data, int nFingers, double times
         CFRelease(systemWideElement);
         systemWideElement = NULL;
     }
-    if (deviceList != NULL) {
-        CFRelease(deviceList);
-        deviceList = NULL;
+    if (me == self) {
+        me = nil;
     }
     [super dealloc];
 }

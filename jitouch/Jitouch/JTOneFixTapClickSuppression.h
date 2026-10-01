@@ -53,6 +53,16 @@ void JTOneFixTapClickSuppressionEnd(
     JTOneFixTapClickSuppression *suppression,
     uint64_t nowNanos);
 
+/*
+ * Ends contact ownership once every contact has lifted, even when the One-Fix
+ * recognizer was skipped (character recognition, move/resize) and never saw
+ * the release. A no-op when the contact is not owned, so it cannot extend an
+ * existing grace window.
+ */
+void JTOneFixTapClickSuppressionContactsLifted(
+    JTOneFixTapClickSuppression *suppression,
+    uint64_t nowNanos);
+
 bool JTOneFixTapClickSuppressionShouldSuppress(
     JTOneFixTapClickSuppression *suppression,
     JTOneFixPointerEvent event,

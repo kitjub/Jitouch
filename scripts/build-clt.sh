@@ -92,6 +92,7 @@ compile_app() {
         "$repo_root/jitouch/Jitouch/JTKeyboardEvent.c" \
         "$repo_root/jitouch/Jitouch/JTOneFixTapClassifier.c" \
         "$repo_root/jitouch/Jitouch/JTOneFixTapClickSuppression.c" \
+        "$repo_root/jitouch/Jitouch/JTPreviousWindowPolicy.c" \
         "$repo_root/jitouch/Jitouch/JTShortcutDispatchPolicy.c"; do
         name="engine-$(basename "${source%.c}").o"
         "$clang" "${common[@]}" -std=c11 -Wall -Wextra -Werror \
@@ -132,6 +133,7 @@ compile_engine_smoke() {
         "$repo_root/jitouch/Jitouch/JTKeyboardEvent.c" \
         "$repo_root/jitouch/Jitouch/JTOneFixTapClassifier.c" \
         "$repo_root/jitouch/Jitouch/JTOneFixTapClickSuppression.c" \
+        "$repo_root/jitouch/Jitouch/JTPreviousWindowPolicy.c" \
         "$repo_root/jitouch/Jitouch/JTShortcutDispatchPolicy.c" \
         "$repo_root/modern/settings/JTThreeFingerGestureSafety.m" \
         -F"$framework_dir" -framework MultitouchSupport \

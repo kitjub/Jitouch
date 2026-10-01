@@ -68,12 +68,32 @@ int main(void) {
                &suppression, JTOneFixPointerEventLeftDown, now),
            "reset restores ordinary clicking");
 
+    JTOneFixTapClickSuppressionBegin(&suppression);
+    JTOneFixTapClickSuppressionContactsLifted(&suppression, now);
+    Assert(JTOneFixTapClickSuppressionShouldSuppress(
+               &suppression, JTOneFixPointerEventLeftDown,
+               now + JT_ONE_FIX_TAP_CLICK_GRACE_NANOS - 1),
+           "lifting an owned contact still honors the grace window");
+    JTOneFixTapClickSuppressionShouldSuppress(
+        &suppression, JTOneFixPointerEventLeftUp, now);
+    Assert(!JTOneFixTapClickSuppressionShouldSuppress(
+               &suppression, JTOneFixPointerEventLeftDown,
+               now + JT_ONE_FIX_TAP_CLICK_GRACE_NANOS + 1),
+           "ownership missed by a skipped recognizer cannot stick");
+    JTOneFixTapClickSuppressionContactsLifted(
+        &suppression, now + JT_ONE_FIX_TAP_CLICK_GRACE_NANOS * 2);
+    Assert(!JTOneFixTapClickSuppressionShouldSuppress(
+               &suppression, JTOneFixPointerEventRightDown,
+               now + JT_ONE_FIX_TAP_CLICK_GRACE_NANOS * 2),
+           "lifting without ownership does not open a new grace window");
+
     Assert(!JTOneFixTapClickSuppressionShouldSuppress(
                NULL, JTOneFixPointerEventLeftDown, now),
            "a null policy never consumes input");
     JTOneFixTapClickSuppressionBegin(NULL);
     JTOneFixTapClickSuppressionEnd(NULL, now);
     JTOneFixTapClickSuppressionReset(NULL);
+    JTOneFixTapClickSuppressionContactsLifted(NULL, now);
 
     printf("one-fix click suppression tests passed (%d assertions)\n",
            assertions);

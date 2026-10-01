@@ -45,6 +45,7 @@ test:
 	@./scripts/test-command-dispatch-policy.sh
 	@./scripts/test-keyboard-event.sh
 	@./scripts/test-shortcut-dispatch-policy.sh
+	@./scripts/test-previous-window-policy.sh
 	@./scripts/test-one-fix-tap-classifier.sh
 	@./scripts/test-one-fix-tap-click-suppression.sh
 

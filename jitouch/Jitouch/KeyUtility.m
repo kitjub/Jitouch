@@ -86,8 +86,11 @@ static void languageChanged(CFNotificationCenterRef center, void *observer, CFSt
 - (void)simulateKeyCode:(CGKeyCode)code ShftDown:(BOOL)shft CtrlDown:(BOOL)ctrl AltDown:(BOOL)alt CmdDown:(BOOL)cmd targetPID:(pid_t)targetPID {
     if (code >= 128) return;
     CGEventFlags flags = JTKeyboardEventModifierFlags(shft, ctrl, alt, cmd);
-    PostKeyboardPair(a[code], flags,
-                     JTKeyboardEventDeliveryTargetApplication, targetPID);
+    // Without a target, post the full modifier chord like a physical keyboard.
+    JTKeyboardEventDelivery delivery = targetPID > 0
+        ? JTKeyboardEventDeliveryTargetApplication
+        : JTKeyboardEventDeliveryUserSession;
+    PostKeyboardPair(a[code], flags, delivery, targetPID);
 }
 
 - (void)simulateKey:(NSString *)key ShftDown:(BOOL)shft CtrlDown:(BOOL)ctrl AltDown:(BOOL)alt CmdDown:(BOOL)cmd targetPID:(pid_t)targetPID {

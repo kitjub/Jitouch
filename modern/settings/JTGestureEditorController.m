@@ -18,6 +18,7 @@ static NSArray<NSString *> *JTBuiltInActions(NSString *commandsKey) {
         @"Refresh", @"Next Tab", @"Previous Tab", @"Open Recently Closed Tab",
         @"Full Screen", @"Launch Finder", @"Launch Browser", @"Show Desktop",
         @"Mission Control", @"Application Windows", @"Application Switcher",
+        @"Previous Window",
         @"Launchpad", @"Scroll to Top", @"Scroll to Bottom", @"Play / Pause",
         @"Next", @"Previous", @"Volume Up", @"Volume Down", @"Brightness Up",
         @"Brightness Down"
