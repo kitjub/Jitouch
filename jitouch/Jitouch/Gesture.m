@@ -28,6 +28,7 @@
 #import "JTOneFixTapClickSuppression.h"
 #import "JTPreviousWindowPolicy.h"
 #import "JTShortcutDispatchPolicy.h"
+#import "JTTapClickFilter.h"
 #import "JTThreeFingerDragPolicy.h"
 #import "JTThreeFingerGestureSafety.h"
 #import "JTVolumeStepAccumulator.h"
@@ -156,6 +157,9 @@ static JTCommandDispatchPolicy commandDispatchPolicy =
     JT_COMMAND_DISPATCH_POLICY_INITIALIZER;
 static JTOneFixTapClickSuppression oneFixTapClickSuppression =
     JT_ONE_FIX_TAP_CLICK_SUPPRESSION_INITIALIZER;
+static JTTapClickFilter tapClickFilter = JT_TAP_CLICK_FILTER_INITIALIZER;
+// The mouse-down JTTapClickFilter is holding. Event-tap (main) thread only.
+static CGEventRef heldTapMouseDown;
 static int autoScrollFlag;
 static int moveResizeFlag, shouldExitMoveResize;
 
@@ -313,6 +317,7 @@ static void turnOffTrackpad() {
     JTEdgeVolumeScrubPolicyReset(&edgeVolumeScrubPolicy);
     JTVolumeStepAccumulatorClear(&volumeStepAccumulator);
     JTOneFixTapClickSuppressionReset(&oneFixTapClickSuppression);
+    JTTapClickFilterReset(&tapClickFilter);
     autoScrollFlag = 0;
 }
 
@@ -376,18 +381,59 @@ static void getMousePosition(CGFloat *x, CGFloat *y) {
     *y = ourLoc.y;
 }
 
+static AXUIElementRef copyAXWindowWithID(pid_t pid, CGWindowID windowID);
+
+/*
+ * The frontmost normal window, from the window server. NSWorkspace and the
+ * Accessibility focused application can name the wrong process when two
+ * instances share a bundle identifier, such as a second Chrome started with
+ * its own profile, so window-level routing asks the window server instead.
+ */
+static BOOL getFrontmostWindow(pid_t *pid, CGWindowID *windowID) {
+    CFArrayRef info = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
+                                                 kCGWindowListExcludeDesktopElements,
+                                                 kCGNullWindowID);
+    BOOL found = NO;
+    if (!info) return NO;
+    for (CFIndex i = 0; i < CFArrayGetCount(info) && !found; i++) {
+        NSDictionary *entry = (NSDictionary *)CFArrayGetValueAtIndex(info, i);
+        NSNumber *alpha = [entry objectForKey:(id)kCGWindowAlpha];
+        CGRect bounds = CGRectZero;
+        CFDictionaryRef boundsDict = (CFDictionaryRef)[entry objectForKey:(id)kCGWindowBounds];
+        if (boundsDict) CGRectMakeWithDictionaryRepresentation(boundsDict, &bounds);
+        JTWindowCandidate window = {
+            [[entry objectForKey:(id)kCGWindowNumber] unsignedIntValue],
+            [[entry objectForKey:(id)kCGWindowOwnerPID] intValue],
+            [[entry objectForKey:(id)kCGWindowLayer] intValue],
+            alpha ? [alpha doubleValue] : 1.0,
+            bounds.size.width, bounds.size.height,
+        };
+        if (JTWindowCandidateIsSwitchable(&window, getpid())) {
+            if (pid) *pid = window.ownerPID;
+            if (windowID) *windowID = window.windowID;
+            found = YES;
+        }
+    }
+    CFRelease(info);
+    return found;
+}
+
 static CFTypeRef getForemostApp() {
     CFTypeRef focusedAppRef = NULL;
-    if (!systemWideElement ||
-        AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedApplicationAttribute, &focusedAppRef) != kAXErrorSuccess) {
-        NSRunningApplication *frontmostApplication = [[NSWorkspace sharedWorkspace] frontmostApplication];
-        if (frontmostApplication == nil) {
-            return NULL;
-        }
-        focusedAppRef = AXUIElementCreateApplication([frontmostApplication processIdentifier]);
-        if (focusedAppRef == NULL) {
-            return NULL;
-        }
+    AXError focusedAppError = systemWideElement
+        ? AXUIElementCopyAttributeValue(systemWideElement, kAXFocusedApplicationAttribute, &focusedAppRef)
+        : kAXErrorFailure;
+    if (focusedAppError != kAXErrorSuccess) {
+        // Fall back to the frontmost window itself rather than NSWorkspace's
+        // frontmost application, which can be another instance of the app.
+        pid_t frontPID = 0;
+        CGWindowID frontWindowID = 0;
+        AXUIElementRef frontWindow = getFrontmostWindow(&frontPID, &frontWindowID)
+            ? copyAXWindowWithID(frontPID, frontWindowID) : NULL;
+        if (logLevel >= LOG_LEVEL_DEBUG)
+            NSLog(@"Focused application unavailable (AXError %d); frontmost window %u of pid %d%@",
+                  (int)focusedAppError, frontWindowID, frontPID, frontWindow ? @"" : @" not found");
+        return frontWindow;
     }
     CFTypeRef focusedWindowRef;
 
@@ -404,7 +450,10 @@ static CFTypeRef getForemostApp() {
         CFRelease(titleRef);
     }
 
-    if (AXUIElementCopyAttributeValue(focusedAppRef, kAXFocusedWindowAttribute, &focusedWindowRef) == kAXErrorSuccess) {
+    AXError focusedWindowError = AXUIElementCopyAttributeValue(focusedAppRef, kAXFocusedWindowAttribute, &focusedWindowRef);
+    if (focusedWindowError != kAXErrorSuccess && logLevel >= LOG_LEVEL_DEBUG)
+        NSLog(@"Focused window unavailable: AXError %d", (int)focusedWindowError);
+    if (focusedWindowError == kAXErrorSuccess) {
         CFRelease(focusedAppRef);
         return focusedWindowRef;
     }
@@ -613,20 +662,6 @@ static AXUIElementRef createApplicationElementWithTimeout(pid_t pid) {
     return app;
 }
 
-static CGWindowID focusedWindowID(void) {
-    CGWindowID windowID = 0;
-    NSRunningApplication *frontmost = [[NSWorkspace sharedWorkspace] frontmostApplication];
-    AXUIElementRef app = frontmost ? createApplicationElementWithTimeout([frontmost processIdentifier]) : NULL;
-    CFTypeRef window = NULL;
-    if (app &&
-        AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, &window) == kAXErrorSuccess &&
-        _AXUIElementGetWindow((AXUIElementRef)window, &windowID) != kAXErrorSuccess) {
-        windowID = 0;
-    }
-    CFSafeRelease(window);
-    CFSafeRelease(app);
-    return windowID;
-}
 
 static AXUIElementRef copyAXWindowWithID(pid_t pid, CGWindowID windowID) {
     AXUIElementRef app = createApplicationElementWithTimeout(pid);
@@ -702,7 +737,8 @@ static void activatePreviousWindow(void) {
             windows[i].width = bounds.size.width;
             windows[i].height = bounds.size.height;
         }
-        size_t n = JTPreviousWindowOrderCandidates(windows, count, focusedWindowID(), getpid(), order, count);
+        // 0 lets the policy treat the frontmost window as the current one.
+        size_t n = JTPreviousWindowOrderCandidates(windows, count, 0, getpid(), order, count);
         for (size_t k = 0; k < n; k++) {
             const JTWindowCandidate *target = &windows[order[k]];
             if (activateWindowWithID(target->ownerPID, target->windowID)) {
@@ -796,8 +832,11 @@ static CFTypeRef axuiUnderMouse() {
     CGFloat x, y;
     AXUIElementRef focusedElement = nil;
     getMousePosition(&x, &y);
-    if (systemWideElement)
-        AXUIElementCopyElementAtPosition(systemWideElement, x, y, &focusedElement);
+    if (systemWideElement) {
+        AXError error = AXUIElementCopyElementAtPosition(systemWideElement, x, y, &focusedElement);
+        if (error != kAXErrorSuccess && logLevel >= LOG_LEVEL_DEBUG)
+            NSLog(@"No accessibility element under the pointer at (%.0f, %.0f): AXError %d", x, y, (int)error);
+    }
     return focusedElement;
 }
 
@@ -906,8 +945,8 @@ static void dispatchCommand(NSString *gesture, int device) {
  * shortcut, as upstream Jitouch always did.
  */
 static pid_t keyboardTargetPID(pid_t pointerPID) {
-    NSRunningApplication *frontmost = [[NSWorkspace sharedWorkspace] frontmostApplication];
-    if (pointerPID > 0 && frontmost != nil && [frontmost processIdentifier] == pointerPID) {
+    pid_t frontPID = 0;
+    if (pointerPID > 0 && getFrontmostWindow(&frontPID, NULL) && frontPID == pointerPID) {
         return pointerPID;
     }
     return 0;
@@ -1923,6 +1962,10 @@ static void gestureTrackpadThreeFingerTap(const Finger *data, int nFingers, doub
         step = 0;
         sttime  = -1;
     }
+    // A stationary three-finger touch: native dragging would turn it into a
+    // click. Movement releases the held click, so dragging is unaffected.
+    if (nativeThreeFingerDragProtection && step == 1)
+        JTTapClickFilterArm(&tapClickFilter, monotonicTimeNanos());
 }
 
 
@@ -2324,6 +2367,9 @@ static void gestureTrackpadTwoFixOneDoubleTap(const Finger *data, int nFingers, 
                         if (data[j].identifier == idf[i])
                             break;
                     if (j == 2) {
+                        // macOS can deliver the last tap's click after this lift.
+                        if (nativeThreeFingerDragProtection)
+                            JTTapClickFilterArm(&tapClickFilter, monotonicTimeNanos());
                         if (i == 0)
                             dispatchCommand(@"Two-Fix Index-Double-Tap", TRACKPAD);
                         else if (i == 1)
@@ -2356,6 +2402,10 @@ static void gestureTrackpadTwoFixOneDoubleTap(const Finger *data, int nFingers, 
             }
         }
     }
+    // With macOS three-finger dragging, each touch of the tapping finger is
+    // also delivered as a click; hold those clicks while the tap is in play.
+    if (nativeThreeFingerDragProtection && step >= 2)
+        JTTapClickFilterArm(&tapClickFilter, monotonicTimeNanos());
 }
 
 
@@ -3481,6 +3531,47 @@ static uint64_t monotonicTimeNanos(void) {
 }
 
 static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
+    if (logLevel >= LOG_LEVEL_DEBUG &&
+        (type == kCGEventLeftMouseDown || type == kCGEventLeftMouseUp ||
+         type == kCGEventRightMouseDown || type == kCGEventRightMouseUp)) {
+        NSLog(@"Pointer event %u with %d trackpad contacts%@", (unsigned int)type, trackpadNFingers,
+              JTThreeFingerDragPolicyIsPassThroughActive(&nativeThreeFingerDragPolicy)
+                  ? @" (native drag pass-through)" : @"");
+    }
+    if (type == kCGEventLeftMouseDown || type == kCGEventLeftMouseDragged ||
+        type == kCGEventLeftMouseUp) {
+        JTTapClickEvent tapEvent = type == kCGEventLeftMouseDown ? JTTapClickEventLeftDown
+            : (type == kCGEventLeftMouseDragged ? JTTapClickEventLeftDragged : JTTapClickEventLeftUp);
+        switch (JTTapClickFilterHandle(&tapClickFilter, tapEvent, monotonicTimeNanos())) {
+            case JTTapClickDecisionHold:
+                CFSafeRelease(heldTapMouseDown);
+                heldTapMouseDown = CGEventCreateCopy(event);
+                return NULL;
+            case JTTapClickDecisionReleaseHeldThenPass:
+                if (heldTapMouseDown) {
+                    // Re-post both so the drag reaches apps strictly after its
+                    // mouse-down; posted events skip this tap.
+                    CGEventTapPostEvent(proxy, heldTapMouseDown);
+                    CFRelease(heldTapMouseDown);
+                    heldTapMouseDown = NULL;
+                    CGEventTapPostEvent(proxy, event);
+                    return NULL;
+                }
+                break;
+            case JTTapClickDecisionDropHeld:
+                CFSafeRelease(heldTapMouseDown);
+                heldTapMouseDown = NULL;
+                if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Dropped the click from a tap gesture");
+                return NULL;
+            case JTTapClickDecisionPass:
+                if (heldTapMouseDown) {
+                    CFRelease(heldTapMouseDown);
+                    heldTapMouseDown = NULL;
+                }
+                break;
+        }
+    }
+
     // Native drag protection is fail-open: every pointer event in a native
     // three-contact sequence is returned untouched before any legacy click,
     // drawing, scrolling, or simulation logic can consume it. The policy stays
@@ -3645,11 +3736,13 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
         }
     } else if (type == kCGEventTapDisabledByUserInput) {
         releaseSimulatedPointerState();
+        JTTapClickFilterReset(&tapClickFilter);
         JTEdgeVolumeScrubPolicyRequestCancel(&edgeVolumeScrubPolicy);
         JTOneFixTapClickSuppressionReset(&oneFixTapClickSuppression);
         CGEventTapEnable(eventTap, true);
     } else if (type == kCGEventTapDisabledByTimeout) {
         releaseSimulatedPointerState();
+        JTTapClickFilterReset(&tapClickFilter);
         JTEdgeVolumeScrubPolicyRequestCancel(&edgeVolumeScrubPolicy);
         JTOneFixTapClickSuppressionReset(&oneFixTapClickSuppression);
         // Event taps and their retry timers belong to the main run loop.  A

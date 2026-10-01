@@ -105,7 +105,8 @@ compile_app() {
         "$repo_root/jitouch/Jitouch/JTOneFixTapClassifier.c" \
         "$repo_root/jitouch/Jitouch/JTOneFixTapClickSuppression.c" \
         "$repo_root/jitouch/Jitouch/JTPreviousWindowPolicy.c" \
-        "$repo_root/jitouch/Jitouch/JTShortcutDispatchPolicy.c"; do
+        "$repo_root/jitouch/Jitouch/JTShortcutDispatchPolicy.c" \
+        "$repo_root/jitouch/Jitouch/JTTapClickFilter.c"; do
         name="engine-$(basename "${source%.c}").o"
         "$clang" "${common[@]}" -std=c11 -Wall -Wextra -Werror \
             -c "$source" -o "$objects/$name"
@@ -150,6 +151,7 @@ compile_engine_smoke() {
         "$repo_root/jitouch/Jitouch/JTOneFixTapClickSuppression.c" \
         "$repo_root/jitouch/Jitouch/JTPreviousWindowPolicy.c" \
         "$repo_root/jitouch/Jitouch/JTShortcutDispatchPolicy.c" \
+        "$repo_root/jitouch/Jitouch/JTTapClickFilter.c" \
         "$repo_root/modern/settings/JTThreeFingerGestureSafety.m" \
         -F"$framework_dir" -framework MultitouchSupport \
         -framework Cocoa -framework Carbon -framework IOKit -framework ScriptingBridge \
