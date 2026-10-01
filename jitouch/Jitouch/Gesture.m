@@ -742,8 +742,24 @@ static void activatePreviousWindow(void) {
         for (size_t k = 0; k < n; k++) {
             const JTWindowCandidate *target = &windows[order[k]];
             if (activateWindowWithID(target->ownerPID, target->windowID)) {
-                if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Previous Window activated window %u of pid %d",
-                                                       target->windowID, target->ownerPID);
+                if (logLevel >= LOG_LEVEL_DEBUG) {
+                    NSLog(@"Previous Window activated window %u of pid %d",
+                          target->windowID, target->ownerPID);
+                    // macOS may defer or ignore activation requested by a
+                    // background app; then the window is raised but the first
+                    // click only activates it. Record whether it took effect.
+                    CGWindowID targetWindow = target->windowID;
+                    pid_t targetPID = target->ownerPID;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                        pid_t frontPID = 0;
+                        CGWindowID frontWindow = 0;
+                        getFrontmostWindow(&frontPID, &frontWindow);
+                        pid_t activePID = [[[NSWorkspace sharedWorkspace] frontmostApplication] processIdentifier];
+                        NSLog(@"Previous Window check: front window %u of pid %d, active app pid %d (%@)",
+                              frontWindow, frontPID, activePID,
+                              frontWindow == targetWindow && activePID == targetPID ? @"ok" : @"NOT ACTIVE");
+                    });
+                }
                 break;
             }
         }
