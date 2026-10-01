@@ -15,13 +15,20 @@ The store sends the complete preferences dictionary after a change because the
 existing engine's notification handler replaces its in-memory dictionary with
 the notification's `userInfo`.
 
-The programmatic window edits the established general, Trackpad, Magic Mouse,
-and drawing-recognition keys. Its gesture editor updates selected rows in the
-nested command arrays while preserving unknown legacy rows and existing
-application-specific assignments that the user did not edit.
+The settings window is SwiftUI (`ui/`), laid out like System Settings: a
+sidebar with General, Trackpad, Magic Mouse and Drawing pages, grouped forms,
+and gesture assignments grouped by application. It edits the established
+general, Trackpad, Magic Mouse and drawing-recognition keys through
+`JTSettingsStore`, which updates selected rows in the nested command arrays
+while preserving unknown legacy rows and application-specific assignments the
+user did not edit.
 
-All UI is created in Objective-C, so the target needs no storyboard, XIB,
-`ibtool`, or Xcode project. Compile the files in this directory with ARC and link
-`Cocoa.framework`. The final combined app uses `LSUIElement = true` and the
-separate bundle identifier `com.jitouch.JitouchModern`; the preferences adapter
-continues to address the legacy `com.jitouch.Jitouch` domain explicitly.
+The menu-bar item, engine lifecycle and preferences adapter stay in
+Objective-C. `ui/JTSwiftBridge.h` exposes them to Swift, and the Swift module
+emits `JitouchModern-Swift.h` so the app delegate can open the window. There is
+still no storyboard, XIB, `ibtool` or Xcode project: `scripts/build-clt.sh`
+compiles the Swift files with `swiftc` from the Command Line Tools and links
+them with the ARC Objective-C files, `Cocoa.framework` and `SwiftUI.framework`.
+The final combined app uses `LSUIElement = true` and the separate bundle
+identifier `com.jitouch.JitouchModern`; the preferences adapter continues to
+address the legacy `com.jitouch.Jitouch` domain explicitly.

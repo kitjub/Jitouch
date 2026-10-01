@@ -1,4 +1,4 @@
 #import <Cocoa/Cocoa.h>
 
-@interface JTSettingsAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@interface JTSettingsAppDelegate : NSObject <NSApplicationDelegate>
 @end

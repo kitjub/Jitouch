@@ -7,6 +7,7 @@ build_root="${BUILD_DIR:-$repo_root/build}"
 mode="${1:-settings}"
 sdk="$(xcrun --sdk macosx --show-sdk-path)"
 clang="$(xcrun --sdk macosx --find clang)"
+swiftc="$(xcrun --sdk macosx --find swiftc)"
 framework_dir="/System/Library/PrivateFrameworks"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -14,6 +15,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 preflight() {
     [[ "$(uname -m)" == arm64 ]] || die "this personal build targets Apple Silicon (arm64)"
     [[ -x "$clang" ]] || die "clang is unavailable; install Apple Command Line Tools"
+    [[ -x "$swiftc" ]] || die "swiftc is unavailable; install Apple Command Line Tools"
     [[ -d "$sdk" ]] || die "macOS SDK is unavailable"
     [[ -d "$framework_dir/MultitouchSupport.framework" ]] || die "MultitouchSupport.framework is unavailable on this macOS"
     command -v codesign >/dev/null || die "codesign is unavailable"
@@ -37,16 +39,26 @@ compile_app() {
     local source name
     local linked_objects=()
 
-    # The new AppKit lifecycle and settings UI use ARC.
+    # The SwiftUI settings window. It also emits JitouchModern-Swift.h, which
+    # the Objective-C app delegate imports, so it must compile first.
+    "$swiftc" -target arm64-apple-macos13.0 -sdk "$sdk" -swift-version 5 \
+        -parse-as-library -O -wmo -module-name JitouchModern \
+        -import-objc-header "$repo_root/modern/settings/ui/JTSwiftBridge.h" \
+        -Xcc -I"$repo_root/modern/settings" -Xcc -I"$repo_root/modern/engine" \
+        -emit-objc-header-path "$objects/JitouchModern-Swift.h" \
+        -emit-module-path "$objects/JitouchModern.swiftmodule" \
+        -c "$repo_root"/modern/settings/ui/*.swift -o "$objects/settings-ui-swift.o"
+    linked_objects+=("$objects/settings-ui-swift.o")
+
+    # The new AppKit lifecycle and settings store use ARC.
     for source in \
         "$repo_root/modern/settings/main.m" \
         "$repo_root/modern/settings/JTSettingsAppDelegate.m" \
         "$repo_root/modern/settings/JTSettingsStore.m" \
-        "$repo_root/modern/settings/JTGestureEditorController.m" \
         "$repo_root/modern/settings/JTShortcutRecorderField.m" \
         "$repo_root/modern/settings/JTThreeFingerGestureSafety.m"; do
         name="settings-$(basename "${source%.m}").o"
-        "$clang" "${common[@]}" -fobjc-arc -Wall -Wextra -c "$source" -o "$objects/$name"
+        "$clang" "${common[@]}" -fobjc-arc -Wall -Wextra -I "$objects" -c "$source" -o "$objects/$name"
         linked_objects+=("$objects/$name")
     done
 
@@ -100,9 +112,12 @@ compile_app() {
         linked_objects+=("$objects/$name")
     done
 
-    "$clang" -arch arm64 -isysroot "$sdk" "${linked_objects[@]}" \
+    "$clang" -arch arm64 -isysroot "$sdk" -mmacosx-version-min=13.0 "${linked_objects[@]}" \
+        -L"$sdk/usr/lib/swift" -L"$(dirname "$swiftc")/../lib/swift/macosx" \
+        -Xlinker -rpath -Xlinker /usr/lib/swift \
         -F"$framework_dir" -framework MultitouchSupport \
         -framework Cocoa -framework Carbon -framework IOKit -framework ScriptingBridge \
+        -framework SwiftUI \
         -o "$binary"
     cp "$repo_root/packaging/Jitouch-Info.plist" "$app/Contents/Info.plist"
     cp "$repo_root/jitouch/jitouchicon.icns" "$resources/jitouchicon.icns"
