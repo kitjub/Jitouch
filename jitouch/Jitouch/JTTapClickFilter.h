@@ -11,10 +11,10 @@ extern "C" {
 
 /*
  * With macOS three-finger dragging on, every touch of a Two-Fix double tap
- * (or a stationary three-finger tap) reaches apps as a left click, which
- * activates whatever window is under the pointer. While a tap gesture is
- * armed, the filter holds the mouse-down: a drag releases it so native
- * dragging still works, and a mouse-up with no drag drops both.
+ * reaches apps as a left click, which activates whatever window is under the
+ * pointer. While a tap gesture is armed, the filter holds the mouse-down: the
+ * first drag is delivered as that mouse-down so native dragging still works,
+ * and a mouse-up with no drag drops both.
  *
  * Arm is called from the multitouch thread; Handle and Reset run on the
  * event-tap (main) thread.
@@ -40,7 +40,7 @@ typedef enum {
     JTTapClickDecisionPass,
     /* Keep a copy of this mouse-down and swallow it for now. */
     JTTapClickDecisionHold,
-    /* A drag started: post the held mouse-down, then this event. */
+    /* A drag started: deliver this event as the held mouse-down. */
     JTTapClickDecisionReleaseHeldThenPass,
     /* A tap ended without moving: swallow this mouse-up and the held down. */
     JTTapClickDecisionDropHeld,

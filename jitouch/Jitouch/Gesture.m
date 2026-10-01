@@ -1978,10 +1978,6 @@ static void gestureTrackpadThreeFingerTap(const Finger *data, int nFingers, doub
         step = 0;
         sttime  = -1;
     }
-    // A stationary three-finger touch: native dragging would turn it into a
-    // click. Movement releases the held click, so dragging is unaffected.
-    if (nativeThreeFingerDragProtection && step == 1)
-        JTTapClickFilterArm(&tapClickFilter, monotonicTimeNanos());
 }
 
 
@@ -2343,6 +2339,10 @@ static void gestureTrackpadSwipeFourFingers(const Finger *data, int nFingers) {
 
 static void gestureTrackpadTwoFixOneDoubleTap(const Finger *data, int nFingers, double timestamp) {
     static int step = 0;
+    // Fingers landing for a three-finger drag pass through two contacts for a
+    // few milliseconds; a real Two-Fix posture rests first.
+    static double restStart;
+    static int restingPosture;
     static double sttime;
     static float fing[3][2];
     static int idf[3];
@@ -2351,7 +2351,9 @@ static void gestureTrackpadTwoFixOneDoubleTap(const Finger *data, int nFingers, 
     	  step = 0;
     if (step == 0 && nFingers == 2) {
         step = 1;
+        restStart = timestamp;
     } else if (step == 1 && nFingers == 3 && data[0].size > 0.15 && data[1].size > 0.15 && data[2].size > 0.15) {
+        restingPosture = timestamp - restStart >= 0.1;
         for (i = 0; i < 3; i++) {
             fing[i][0] = data[i].px;
             fing[i][1] = data[i].py;
@@ -2384,7 +2386,7 @@ static void gestureTrackpadTwoFixOneDoubleTap(const Finger *data, int nFingers, 
                             break;
                     if (j == 2) {
                         // macOS can deliver the last tap's click after this lift.
-                        if (nativeThreeFingerDragProtection)
+                        if (nativeThreeFingerDragProtection && restingPosture)
                             JTTapClickFilterArm(&tapClickFilter, monotonicTimeNanos());
                         if (i == 0)
                             dispatchCommand(@"Two-Fix Index-Double-Tap", TRACKPAD);
@@ -2420,7 +2422,7 @@ static void gestureTrackpadTwoFixOneDoubleTap(const Finger *data, int nFingers, 
     }
     // With macOS three-finger dragging, each touch of the tapping finger is
     // also delivered as a click; hold those clicks while the tap is in play.
-    if (nativeThreeFingerDragProtection && step >= 2)
+    if (nativeThreeFingerDragProtection && restingPosture && step >= 2)
         JTTapClickFilterArm(&tapClickFilter, monotonicTimeNanos());
 }
 
@@ -3562,16 +3564,21 @@ static CGEventRef CGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
             case JTTapClickDecisionHold:
                 CFSafeRelease(heldTapMouseDown);
                 heldTapMouseDown = CGEventCreateCopy(event);
+                if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Holding a click during a tap gesture");
                 return NULL;
             case JTTapClickDecisionReleaseHeldThenPass:
                 if (heldTapMouseDown) {
-                    // Re-post both so the drag reaches apps strictly after its
-                    // mouse-down; posted events skip this tap.
-                    CGEventTapPostEvent(proxy, heldTapMouseDown);
+                    // Deliver this first drag as the held mouse-down. Re-posting
+                    // the held event could reach apps after later drags, which
+                    // made them ignore the whole drag.
+                    CGEventSetType(event, kCGEventLeftMouseDown);
+                    CGEventSetIntegerValueField(event, kCGMouseEventClickState,
+                        CGEventGetIntegerValueField(heldTapMouseDown, kCGMouseEventClickState));
+                    CGEventSetIntegerValueField(event, kCGMouseEventDeltaX, 0);
+                    CGEventSetIntegerValueField(event, kCGMouseEventDeltaY, 0);
                     CFRelease(heldTapMouseDown);
                     heldTapMouseDown = NULL;
-                    CGEventTapPostEvent(proxy, event);
-                    return NULL;
+                    if (logLevel >= LOG_LEVEL_DEBUG) NSLog(@"Released a held click as a drag");
                 }
                 break;
             case JTTapClickDecisionDropHeld:
