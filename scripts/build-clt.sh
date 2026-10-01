@@ -117,7 +117,7 @@ compile_app() {
         -Xlinker -rpath -Xlinker /usr/lib/swift \
         -F"$framework_dir" -framework MultitouchSupport \
         -framework Cocoa -framework Carbon -framework IOKit -framework ScriptingBridge \
-        -framework SwiftUI \
+        -framework SwiftUI -framework ServiceManagement \
         -o "$binary"
     cp "$repo_root/packaging/Jitouch-Info.plist" "$app/Contents/Info.plist"
     cp "$repo_root/jitouch/jitouchicon.icns" "$resources/jitouchicon.icns"

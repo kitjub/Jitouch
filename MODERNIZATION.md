@@ -18,8 +18,8 @@ Accessibility permission.
 
 ## Modern personal build
 
-The modern target combines the retained gesture engine with a programmatic
-AppKit menu-bar/settings application. It has no XIB, Preference Pane, or Xcode
+The modern target combines the retained gesture engine with an AppKit menu-bar
+app and a SwiftUI settings window. It has no XIB, Preference Pane, or Xcode
 project dependency and builds as a native arm64 app using Command Line Tools.
 The existing `com.jitouch.Jitouch` preferences domain and gesture command arrays
 are preserved, while the app identity is separated as

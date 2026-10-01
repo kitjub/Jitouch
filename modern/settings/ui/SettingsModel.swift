@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import ServiceManagement
 import SwiftUI
 
 struct Assignment: Identifiable {
@@ -186,6 +187,36 @@ final class SettingsModel: ObservableObject {
 
     func groups(for kind: DeviceKind) -> [AssignmentGroup] {
         groups[kind] ?? []
+    }
+
+    // MARK: Login item
+
+    /// `make install` registers its own LaunchAgent; the login item is for
+    /// people who downloaded the app instead.
+    var installerLaunchAgentPresent: Bool {
+        let path = ("~/Library/LaunchAgents/com.jitouch.JitouchModern.agent.plist" as NSString)
+            .expandingTildeInPath
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    var launchAtLoginStatus: SMAppService.Status { SMAppService.mainApp.status }
+
+    var launchAtLoginBinding: Binding<Bool> {
+        Binding(get: {
+            let status = self.launchAtLoginStatus
+            return status == .enabled || status == .requiresApproval
+        }, set: { enabled in
+            do {
+                if enabled {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+            } catch {
+                self.errorMessage = "Couldn't change Open at Login: \(error.localizedDescription)"
+            }
+            self.objectWillChange.send()
+        })
     }
 
     // MARK: Actions

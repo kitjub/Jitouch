@@ -178,6 +178,19 @@ struct GeneralPane: View {
             .disabled(!model.isEnabled)
 
             Section {
+                if model.installerLaunchAgentPresent {
+                    LabeledContent("Open at login") {
+                        Text("On (set up by make install)")
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Toggle(isOn: model.launchAtLoginBinding) {
+                        Text("Open at login")
+                        if model.launchAtLoginStatus == .requiresApproval {
+                            Text("Allow Jitouch Modern in System Settings › General › Login Items.")
+                        }
+                    }
+                }
                 Toggle("Show in menu bar", isOn: model.boolBinding("ShowIcon", default: true))
                 Picker("Logging", selection: model.integerBinding("LogLevel", default: 0)) {
                     Text("Quiet").tag(-1)

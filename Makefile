@@ -1,4 +1,4 @@
-.PHONY: all app settings engine-smoke verify probe test install install-trial activate uninstall clean
+.PHONY: all app settings engine-smoke verify probe test release install install-trial activate uninstall clean
 
 BUILD_DIR ?= $(CURDIR)/build
 APP_BUNDLE := $(BUILD_DIR)/Jitouch Modern.app
@@ -17,6 +17,9 @@ engine-smoke:
 
 verify:
 	@BUILD_DIR="$(BUILD_DIR)" ./scripts/build-clt.sh verify
+
+release:
+	@BUILD_DIR="$(BUILD_DIR)" ./scripts/package-release.sh
 
 install: all verify
 	@BUILD_DIR="$(BUILD_DIR)" ./scripts/install-personal.sh

@@ -14,7 +14,8 @@ make verify
 The integrated gesture engine and programmatic settings application is written
 to `build/Jitouch Modern.app`. It is arm64-only and ad-hoc signed for local use.
 Open it with Finder or `open "build/Jitouch Modern.app"` and grant Accessibility
-and Apple Events permissions when macOS requests them.
+and Input Monitoring permissions when macOS requests them. `make release`
+packages the same app as a zip for GitHub releases.
 
 `build/JitouchEngine-arm64` is deliberately a smoke-test executable. It proves
 that the unchanged engine compiles and links against the current private

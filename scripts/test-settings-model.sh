@@ -25,7 +25,7 @@ done
     "$repo_root/modern/settings/ui/SettingsModel.swift" \
     "$repo_root/tests/SettingsModelTests/main.swift" \
     "$test_build"/*.o \
-    -framework Cocoa -framework SwiftUI \
+    -framework Cocoa -framework SwiftUI -framework ServiceManagement \
     -o "$test_build/SettingsModelTests"
 
 "$test_build/SettingsModelTests"
