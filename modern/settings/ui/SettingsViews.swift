@@ -123,7 +123,7 @@ struct GeneralPane: View {
         Form {
             Section {
                 HStack(spacing: 14) {
-                    Image(nsImage: NSApp.applicationIconImage)
+                    Image(nsImage: Bundle.main.image(forResource: "jitouchicon") ?? NSApp.applicationIconImage)
                         .resizable()
                         .frame(width: 52, height: 52)
                     VStack(alignment: .leading, spacing: 3) {
@@ -192,6 +192,27 @@ struct GeneralPane: View {
             }
         }
         .formStyle(.grouped)
+        .toolbar { ToolbarPlaceholder() }
+    }
+}
+
+/// An invisible toolbar item. Without any item, macOS drops the toolbar and
+/// this page gets a thin title bar while the other pages keep a full toolbar.
+struct ToolbarPlaceholder: ToolbarContent {
+    var body: some ToolbarContent {
+        if #available(macOS 26.0, *) {
+            item.sharedBackgroundVisibility(.hidden)
+        } else {
+            item
+        }
+    }
+
+    private var item: some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .accessibilityHidden(true)
+        }
     }
 }
 
